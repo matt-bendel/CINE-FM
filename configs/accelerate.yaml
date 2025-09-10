@@ -1,0 +1,8 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU         # <- DDP
+num_processes: 4                    # <- #GPUs / processes
+mixed_precision: 'no'
+use_cpu: false
+downcast_bf16: 'no'
+rdzv_backend: 'static'
+same_network: true

@@ -1,0 +1,40 @@
+# configs/eval_vae.yaml
+device: cuda
+out_dir: eval_out
+max_items: 64              # how many validation items to evaluate
+locality_probes: 4         # number of latent positions perturbed per sample
+locality_eps: 0.1          # latent poke magnitude
+robust_noise_sigma: 0.02   # additive complex noise strength in [-1,1] scale
+robust_phase_deg: 5.0      # global phase jitter in degrees
+gauss_subsample_positions: 8192
+save_example_images: true
+
+model:
+  import_path: model.vae
+  class_name: CardiacVAE
+  args:
+    in_channels: 2
+    z_dim: 16
+    dim: 128
+    dim_mult: [1,2,4,4]
+    num_res_blocks: 2
+    attn_scales: []
+    dropout: 0.0
+  load_state_dict_from: /path/to/your/ckpt_or_state.pt
+
+val_dataset:
+  name: CINEDataset
+  args:
+    root: /storage/CINE_data/val
+    mode: videos         # or 'pretrain_2d' (T=1) — script supports both
+    random_time_length: false
+    enforce_odd_length: true
+    min_frames: 1
+    max_frames: 9999
+    pad_to_mult_of_8: true    # keep dims divisible by 8 (your VAE expects it)
+    normalize_to_unit: true   # map raw to [-1,1] if your dataset needs this
+
+dataloader:
+  val_batch_size: 1      # ragged data handled per-sample; keep at 1 or small
+  num_workers: 4
+  pin_memory: true

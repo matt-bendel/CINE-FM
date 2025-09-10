@@ -1,0 +1,100 @@
+# -----------------------------
+# CardiacVAE training (stage-aware; step-based)
+# -----------------------------
+
+debug_steps: 1550
+
+stages:
+  mode: videos   # or videos
+
+train_dataset:
+  name: CINEDataset
+  args:
+    root: /storage/CINE_data
+    split: train
+    stage_mode: videos  # or videos
+val_dataset:
+  name: CINEDataset
+  args:
+    root: /storage/CINE_data
+    split: val
+    stage_mode: videos  # or videos
+dataloader:
+  train_batch_size: 2
+  val_batch_size: 2
+  num_workers: 6
+  pin_memory: false
+  shuffle: true
+
+# Model
+model:
+  import_path: CardiacVAE.model.vae   # python module containing CardiacVAE
+  class_name: CardiacVAE
+  args:
+    in_channels: 2
+    z_dim: 16
+    dim: 128
+    dim_mult: [1, 2, 4, 4]
+    num_res_blocks: 2
+    attn_scales: []
+    dropout: 0.0
+  load_state_dict_from: None
+  strict_load: false
+
+# Optimization (step-based)
+optim:
+  lr: 0.0002
+  betas: [0.9, 0.99]
+  weight_decay: 0.0
+  grad_clip: 1.0
+  total_steps: 200000
+  accum_steps: 1
+  scheduler:
+    type: cosine
+    eta_min_ratio: 0.1  # final lr = lr * eta_min_ratio
+
+# Loss weights & schedules (per stage)
+loss:
+  pretrain_2d:
+    complex_l1: true
+    use_lpips: true
+    w_img: 3.0
+    w_k: 0.3
+    w_lpips: 3.0
+    w_kl: 3e-6
+    w_ortho: 1e-6
+    schedules:
+      kl:     {type: linear, start_scale: 0.0, end_scale: 1.0, pct_of_steps: 0.4}
+      ortho:  {type: linear, start_scale: 0.0, end_scale: 1.0, pct_of_steps: 0.6}
+      lpips:  {type: cosine, start_scale: 0.5, end_scale: 1.0, pct_of_steps: 0.2}
+
+  videos:
+    complex_l1: true
+    use_lpips: true
+    lpips_frames: 'all'
+    w_img: 3.0
+    w_k: 0.3
+    w_lpips: 3.0
+    # w_kl: 3e-6
+    # w_tvz: 1e-3
+    # w_ortho: 1e-6
+    w_kl: 0.0
+    w_ortho: 0.0
+    w_tvz: 0.0
+    schedules:
+      kl:     {type: linear, start_scale: 0.5, end_scale: 1.0, pct_of_steps: 0.2}
+      tvz:    {type: linear, start_scale: 0.2, end_scale: 1.0, pct_of_steps: 0.5}
+      ortho:  {type: linear, start_scale: 0.0, end_scale: 1.0, pct_of_steps: 0.5}
+      lpips:  {type: cosine, start_scale: 0.5, end_scale: 1.0, pct_of_steps: 0.2}
+
+# Logging / Validation / Checkpoints
+logging:
+  project: cardiac-vae
+  run_name: wan_vae_l1_and_lpips_complex
+  log_every_steps: 10
+  val_every_steps: 500
+  save_every_steps: 2500
+  val_num_batches: 50
+  out_dir: /storage/matt_models/cardiac_vae
+  wandb_dir: /storage/matt_models/wandb
+  wandb_cache_dir: storage/matt_models/wandbcache
