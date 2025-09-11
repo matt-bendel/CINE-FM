@@ -48,6 +48,8 @@ class CausalConv3d(nn.Conv3d):
 
         if need_left > 0 and cache_x is not None:
             cache_x = cache_x.to(x.device)
+            if self._ph > 0 or self._pw > 0:
+                cache_x = F.pad(cache_x, (self._pw, self._pw, self._ph, self._ph, 0, 0), mode='reflect')
             # Trim cache to at most what we need (use the most recent frames)
             if cache_x.shape[2] > need_left:
                 cache_x = cache_x[:, :, -need_left:, :, :]
@@ -522,7 +524,8 @@ class WanVAE_(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.attn_scales = attn_scales
         self.temperal_downsample = temperal_downsample
-        self.temperal_upsample = temperal_downsample[::-1]
+        # self.temperal_upsample = temperal_downsample[::-1]
+        self.temperal_upsample = [False, True]
 
         self.temporal_downsample_factor = 2
         if self.temperal_downsample[1]:
@@ -698,8 +701,8 @@ class CardiacVAE(WanVAE_):
                  z_dim: int = 16,
                  dim: int = 128,
                  dim_mult=(1, 2, 4),
-                 num_res_blocks: int = 2,
-                 attn_scales=(),
+                 num_res_blocks: int = 3,
+                 attn_scales=(128),
                  dropout: float = 0.0):
         # Only 2x temporal downsample (first stage); spatial 4x via dim_mult
         temperal_downsample = [True, False, False]

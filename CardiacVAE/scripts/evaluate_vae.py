@@ -152,12 +152,34 @@ def complex_mag(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:  # [2,T,H,W
     return (x.pow(2).sum(dim=0, keepdim=True) + eps).sqrt()
 
 @torch.no_grad()
+def snr_complex(x: torch.Tensor, xhat: torch.Tensor, eps: float = 1e-12) -> float:
+    """
+    Complex SNR in dB on the full complex tensor [2,T,H,W]:
+        SNR(xhat,x) = 10 * log10( ||x||^2 / ||xhat - x||^2 )
+    """
+    signal_energy = x.pow(2).sum().item()
+    noise_energy  = (xhat - x).pow(2).sum().item()
+    return 10.0 * math.log10(signal_energy / noise_energy)
+
+@torch.no_grad()
+def fft2c(x: torch.Tensor) -> torch.Tensor:  # [2,T,H,W] -> [2,T,H,W] in k-space
+    xr, xi = x[0], x[1]
+    xc = torch.complex(xr, xi)
+    k = torch.fft.fft2(xc, norm="ortho")
+    return torch.stack((k.real, k.imag), dim=0)
+
+@torch.no_grad()
+def charb_l1(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> float:
+    diff = x - y
+    return (diff.pow(2) + eps * eps).sqrt().mean().item()
+
+@torch.no_grad()
 def psnr_mag(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> float:
     xm, ym = complex_mag(x), complex_mag(y)
     mse = (xm - ym).pow(2).mean().item()
     if mse <= eps:
         return 99.0
-    max_I = math.sqrt(2.0)  # safe bound
+    max_I = math.sqrt(2.0)  # safe bound for |complex|
     return 10.0 * math.log10((max_I * max_I) / mse)
 
 @torch.no_grad()
@@ -205,20 +227,40 @@ def make_grid_from_channels(maps: torch.Tensor, max_ch: int = 16) -> torch.Tenso
     return torch.cat(tiles, dim=-2)  # [rows*H, cols*W]
 
 def save_video_from_1t(frames_1t_hw: torch.Tensor, path: str, fps: int = 7):
-    """frames_1t_hw: [1,T,H,W] in arbitrary scale -> uint8 frames -> mp4/gif"""
     import imageio.v2 as iio
     T = int(frames_1t_hw.shape[1])
     frames = [frame_to_uint8(frames_1t_hw[:, t]) for t in range(T)]
-    # Prefer mp4 if available, else gif
     ext = os.path.splitext(path)[1].lower()
     if ext not in (".mp4", ".gif"): path = path + ".mp4"
     try:
-        iio.mimsave(path, frames, fps=fps)  # works for both mp4 (needs ffmpeg) and gif
+        iio.mimsave(path, frames, fps=fps)
     except Exception:
-        # fallback to gif
         path = os.path.splitext(path)[0] + ".gif"
         iio.mimsave(path, frames, fps=fps)
     return path
+
+@torch.no_grad()
+def save_error_visuals(x: torch.Tensor, xhat: torch.Tensor, out_dir: str, sample_id: int, is_video: bool):
+    """
+    Save error maps:
+      - magnitude error: | |x| - |xhat| |
+      - complex residual magnitude: |x - xhat|
+    x, xhat: [2,T,H,W]
+    """
+    import imageio.v2 as iio
+    xm   = complex_mag(x)      # [1,T,H,W]
+    xhm  = complex_mag(xhat)   # [1,T,H,W]
+    err_mag  = (xm - xhm).abs()                # [1,T,H,W]
+ 
+    if is_video:
+        mid = int(xm.shape[1] // 2)
+        iio.imwrite(os.path.join(out_dir, f"sample{sample_id:03d}_errmag_mid.png"),
+                    to_uint8_abs(err_mag[:, mid]))
+        # full error videos
+        save_video_from_1t(err_mag,  os.path.join(out_dir, f"sample{sample_id:03d}_errmag.mp4"),  fps=7)
+    else:
+        iio.imwrite(os.path.join(out_dir, f"sample{sample_id:03d}_errmag.png"),
+                    to_uint8_abs(err_mag[:, 0]))
 
 # ======================= Smoothness & Gaussianity =======================
 @torch.no_grad()
@@ -264,6 +306,43 @@ def offdiag_cov_abs_mean(mu_all: torch.Tensor) -> float:
     off = cov - torch.diag(torch.diag(cov))
     return off.abs().mean().item()
 
+def save_channel_histograms(Z_all_cpu: torch.Tensor, out_dir: str, max_ch: int = 16, bins: int = 51):
+    """
+    Z_all_cpu: [Npos, C] standardized per-channel (zero-mean/unit-std within-sample already applied)
+    Saves a grid of histograms with N(0,1) overlay to visually assess Gaussianity.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[warn] matplotlib not available for histograms: {e}")
+        return
+    Z = Z_all_cpu.numpy()
+    C = Z.shape[1]
+    k = min(max_ch, C)
+    cols = min(8, k)
+    rows = int((k + cols - 1) // cols)
+    xs = np.linspace(-4.0, 4.0, 401)
+    normal_pdf = 1.0/np.sqrt(2*np.pi) * np.exp(-0.5*xs*xs)
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*2.2, rows*2.0), squeeze=False)
+    for i in range(k):
+        r, c = divmod(i, cols)
+        ax = axes[r][c]
+        ax.hist(Z[:, i], bins=bins, density=True, alpha=0.85)
+        ax.plot(xs, normal_pdf, linewidth=1.0)
+        ax.set_title(f"ch {i}", fontsize=8)
+        ax.set_xlim(-4.0, 4.0)
+        ax.set_yticks([])
+    # hide unused
+    for j in range(k, rows*cols):
+        r, c = divmod(j, cols)
+        axes[r][c].axis("off")
+    plt.tight_layout()
+    path = os.path.join(out_dir, "gauss_channel_histograms.png")
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[viz] saved channel Gaussianity histograms -> {path}")
+
 # ======================= Locality (decoder PSF) =======================
 @torch.no_grad()
 def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: int = 4) -> Dict[str, float]:
@@ -273,10 +352,13 @@ def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: 
     Returns temporal std (frames) and spatial RMS radius of |Δx|.
     """
     device = z.device
-    out0 = decoder_fn(z); 
-    if isinstance(out0, list): out0 = out0[0]
-    if out0.dim() == 5: out0 = out0.squeeze(0)  # [2,t,h,w]
-    base_mag = complex_mag(out0.unsqueeze(0)).squeeze(0)  # [t,h,w]
+    out0 = decoder_fn(z)
+    if isinstance(out0, list): 
+        out0 = out0[0]
+    if out0.dim() == 5: 
+        out0 = out0.squeeze(0)  # -> [2,t,h,w]
+
+    base_mag = complex_mag(out0).squeeze(0)  # [t,h,w]
     T, H, W = base_mag.shape
 
     yy, xx = torch.meshgrid(
@@ -286,14 +368,18 @@ def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: 
     )
     temp_spreads, spatial_rms = [], []
     Cz, n, Hh, Ww = z.shape[1:]
+
     for _ in range(probes):
         c = random.randrange(Cz); tt = random.randrange(n); h = random.randrange(Hh); w = random.randrange(Ww)
         z2 = z.clone()
         z2[0, c, tt, h, w] = z2[0, c, tt, h, w] + eps
         out = decoder_fn(z2)
-        if isinstance(out, list): out = out[0]
-        if out.dim() == 5: out = out.squeeze(0)
-        diff = (complex_mag(out.unsqueeze(0)).squeeze(0) - base_mag).abs()  # [t,h,w]
+        if isinstance(out, list): 
+            out = out[0]
+        if out.dim() == 5: 
+            out = out.squeeze(0)
+
+        diff = (complex_mag(out).squeeze(0) - base_mag).abs()  # [t,h,w]
 
         e_t = diff.sum(dim=(1,2)) + 1e-12
         w_t = e_t / e_t.sum()
@@ -303,15 +389,26 @@ def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: 
         temp_spreads.append(torch.sqrt(var_t).item())
 
         t_star = int(torch.argmax(e_t).item())
-        D = diff[t_star]
-        e_hw = D / (D.sum() + 1e-12)
+
+        E = diff[t_star]**2          # energy
+        E_sum = E.sum() + 1e-12
+        e_hw = (E / E_sum)
+
+        # Optional robust trimming (keep e.g. 99% of the energy):
+        keep = 0.99
+        flat = torch.sort(E.flatten(), descending=True).values
+        th = flat.cumsum(0)
+        th = flat[(th <= keep * E_sum).sum().clamp(min=1)-1]  # threshold at 99% cum energy
+        mask = (E >= th)
+        e_hw = (E * mask) / (E * mask).sum().clamp_min(1e-12)
+        
         cx = (e_hw * xx).sum(); cy = (e_hw * yy).sum()
         r2 = (xx - cx)**2 + (yy - cy)**2
         spatial_rms.append(torch.sqrt((e_hw * r2).sum()).item())
 
     return {
-        "locality_temporal_spread_frames_mean": float(np.mean(temp_spreads)),
-        "locality_spatial_rms_px_mean": float(np.mean(spatial_rms)),
+        "locality_temporal_spread_frames_mean": float(np.mean(temp_spreads)) if temp_spreads else float("nan"),
+        "locality_spatial_rms_px_mean": float(np.mean(spatial_rms)) if spatial_rms else float("nan"),
     }
 
 # ======================= Robustness (full patch pipeline) =======================
@@ -354,7 +451,7 @@ def robustness_metrics_full_pipeline(model, x_full: torch.Tensor, patch_size, pa
         flats = [mu.reshape(-1) for mu in mu_list]
         return torch.cat(flats, dim=0)
 
-    xhat0, _ = _forward_full(x_full)
+    _ = _forward_full(x_full)  # warmup path/sizes
     zvec0 = _encode_vector(x_full)
 
     xn = (x_full + noise_sigma * torch.randn_like(x_full)).clamp_(-1, 1)
@@ -369,16 +466,66 @@ def robustness_metrics_full_pipeline(model, x_full: torch.Tensor, patch_size, pa
 
     def _psnr(xp):
         xh, _ = _forward_full(xp)
-        return psnr_mag(x_full, xh)
+        return snr_complex(x_full, xh)
 
     return {
         "robust_latent_relchange_noise": _rel_latent_change(xn),
         "robust_latent_relchange_phase": _rel_latent_change(xp),
         "robust_latent_relchange_roll":  _rel_latent_change(xr),
-        "robust_psnr_noise": _psnr(xn),
-        "robust_psnr_phase": _psnr(xp),
-        "robust_psnr_roll":  _psnr(xr),
+        "robust_snr_noise": _psnr(xn),
+        "robust_snr_phase": _psnr(xp),
+        "robust_snr_roll":  _psnr(xr),
     }
+
+
+# ======================= Optional LPIPS =======================
+_HAS_LPIPS = False
+try:
+    import lpips
+    _HAS_LPIPS = True
+    _LPIPS_NET = lpips.LPIPS(net="alex").eval()
+    for p in _LPIPS_NET.parameters():
+        p.requires_grad_(False)
+except Exception:
+    _HAS_LPIPS = False
+    _LPIPS_NET = None
+
+@torch.no_grad()
+def _to_lpips_img(mag_1hw: torch.Tensor) -> torch.Tensor:
+    # Map magnitude to [-1,1] with a fixed cap (<= sqrt(2))
+    cap = math.sqrt(2.0)
+    x = torch.nan_to_num(mag_1hw, nan=0.0, posinf=0.0, neginf=0.0)
+    x = (x / cap).clamp_(0, 1) * 2.0 - 1.0
+    return x.repeat(3, 1, 1).unsqueeze(0)
+
+@torch.no_grad()
+def lpips_on_full(x: torch.Tensor, xhat: torch.Tensor) -> float:
+    if not _HAS_LPIPS: 
+        return float("nan")
+    xm  = complex_mag(x)
+    xhm = complex_mag(xhat)
+    T = xm.shape[1]
+    t = T // 2  # middle frame
+    A = _to_lpips_img(xm[:, t])
+    B = _to_lpips_img(xhm[:, t])
+    A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+    B = torch.nan_to_num(B, nan=0.0, posinf=0.0, neginf=0.0)
+    return float(_LPIPS_NET(A, B).mean().item())
+
+@torch.no_grad()
+def to_uint8_abs(img_1hw: torch.Tensor, cap: float = 0.1) -> np.ndarray:
+    """
+    Absolute (fixed-range) rendering for error maps.
+    img_1hw: [1,H,W] nonnegative (we'll clamp)
+    cap: values >= cap map to white; no percentile stretching.
+    """
+    f = img_1hw.detach().float().cpu()
+    f = torch.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0)
+    f = f.clamp_min_(0.0)
+    cap = max(float(cap), 1e-8)
+    g = (f / cap).clamp_(0, 1)
+    g = (g * 255.0).round().to(torch.uint8).squeeze(0)
+    return g.numpy()
 
 # ======================= Main evaluation =======================
 def dynamic_import(import_path: str, class_name: str):
@@ -386,31 +533,32 @@ def dynamic_import(import_path: str, class_name: str):
     return getattr(mod, class_name)
 
 def detect_mode(cfg: Dict[str, Any], sample_tensor: torch.Tensor = None) -> str:
-    # Prefer explicit config
     try:
         m = cfg.get("stages", {}).get("mode", None)
         if m in ("pretrain_2d", "videos"): return m
     except Exception:
         pass
-    # Then dataset arg
     try:
         m = cfg.get("test_dataset", {}).get("args", {}).get("stage_mode", None)
         if m in ("pretrain_2d", "videos"): return m
     except Exception:
         pass
-    # Fallback: infer from tensor
     if sample_tensor is not None and sample_tensor.ndim == 4:
         return "pretrain_2d" if sample_tensor.shape[1] == 1 else "videos"
-    return "videos"  # safe default
+    return "videos"
 
 @torch.no_grad()
 def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
              max_items: int = 64, probes: int = 4, locality_eps: float = 0.1,
-             noise_sigma: float = 0.02, phase_deg: float = 5.0):
+             noise_sigma: float = 0.02, phase_deg: float = 5.0,
+             vis_max: int = 8, hist_max_ch: int = 16, hist_bins: int = 51):
 
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
+
+    if _HAS_LPIPS and _LPIPS_NET is not None:
+        _LPIPS_NET.to(device)
 
     # ---- Dataset (TEST) ----
     dl_cfg = cfg["dataloader"]
@@ -447,7 +595,10 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
     # ---- Accumulators ----
     per_sample_rows = []
     acc_lists = {k: [] for k in [
-        "psnr_recon",
+        "l1_complex",
+        "l1k_complex",
+        "snr_complex",
+        "lpips_middle",
         "smooth_tv3d",
         "smooth_temporal_jerk",
         "locality_temporal_spread_frames_mean",
@@ -455,11 +606,11 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
         "robust_latent_relchange_noise",
         "robust_latent_relchange_phase",
         "robust_latent_relchange_roll",
-        "robust_psnr_noise",
-        "robust_psnr_phase",
-        "robust_psnr_roll",
+        "robust_snr_noise",
+        "robust_snr_phase",
+        "robust_snr_roll",
     ]}
-    Z_chunks = []  # gaussianity accumulation across patches/samples
+    MU_chunks = []  # collect raw mu (not standardized) across patches/samples
 
     # ---- Iterate ----
     n_done = 0
@@ -502,8 +653,11 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
             xhat_i = depatchify(i_rec, (T, H, W), patch_size, strides)
             xhat   = torch.stack((xhat_r, xhat_i), dim=0)  # [2,T,H,W]
 
-            # --- PSNR ---
-            psnr_r = psnr_mag(x, xhat)
+            # --- Full-image metrics ---
+            snr_c  = snr_complex(x, xhat)
+            l1_img = charb_l1(x, xhat)
+            l1k    = charb_l1(fft2c(x), fft2c(xhat))
+            lpips_m = lpips_on_full(x, xhat)
 
             # --- Smoothness (μ over ALL patches concatenated along time) ---
             mu_cat = torch.cat(mu_list, dim=1) if len(mu_list) > 0 else None  # [Cz, sum_n, H', W']
@@ -527,29 +681,25 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                 noise_sigma=noise_sigma, phase_deg=phase_deg
             )
 
-            # --- Gaussianity accumulation (standardize per-patch) ---
+            # --- Gaussianity accumulation (store RAW mu, standardize later globally) ---
             subsample_positions = int(cfg.get("gauss_subsample_positions", 8192))
             for mu in mu_list:
                 C, nH, Hh, Ww = mu.shape
                 M = nH * Hh * Ww
-                Z = mu.reshape(C, M).t().contiguous()  # [M,C]
-                m = Z.mean(dim=0, keepdim=True)
-                s = Z.std(dim=0, keepdim=True).clamp_min(1e-6)
-                Zstd = (Z - m) / s
-                if Zstd.shape[0] > subsample_positions:
-                    idx = torch.randperm(Zstd.shape[0], device=Zstd.device)[:subsample_positions]
-                    Zstd = Zstd[idx]
-                Z_chunks.append(Zstd.cpu())
+                mu_flat = mu.reshape(C, M).t().contiguous()  # [M, C] raw μ (no standardization)
+                if mu_flat.shape[0] > subsample_positions:
+                    idx = torch.randperm(mu_flat.shape[0], device=mu_flat.device)[:subsample_positions]
+                    mu_flat = mu_flat[idx]
+                MU_chunks.append(mu_flat.detach().cpu())
 
-            # --- Visualizations ---
-            save_vis = (n_done < int(cfg.get("save_first_n_visuals", 8)))
+            # --- Visualizations (capped by vis_max) ---
+            save_vis = (n_done < int(vis_max))
             if save_vis:
                 import imageio.v2 as iio
                 xm  = complex_mag(x)    # [1,T,H,W]
                 xhm = complex_mag(xhat) # [1,T,H,W]
 
                 if is_video:
-                    # videos: save mp4s + mid-frame pngs
                     mid = T // 2
                     iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_gt_mid.png"),
                                 frame_to_uint8(xm[:, mid]))
@@ -558,17 +708,21 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                     save_video_from_1t(xm,  os.path.join(out_dir, f"sample{n_done:03d}_gt_mag.mp4"),  fps=7)
                     save_video_from_1t(xhm, os.path.join(out_dir, f"sample{n_done:03d}_recon_mag.mp4"), fps=7)
                 else:
-                    # pretrain_2d: single-frame PNGs
-                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_gt.png"),
-                                frame_to_uint8(xm[:, 0]))
-                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_recon.png"),
-                                frame_to_uint8(xhm[:, 0]))
+                    err = (xm[:, 0] - xhm[:, 0]).abs()
+                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_gt.png"),    frame_to_uint8(xm[:, 0]))
+                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_recon.png"), frame_to_uint8(xhm[:, 0]))
 
-                # latent μ grid (image or video over latent frames)
+                # --- error map visualizations ---
+                try:
+                    save_error_visuals(x, xhat, out_dir, n_done, is_video=is_video)
+                except Exception as e:
+                    print(f"[viz] error-map save failed on sample {n_done}: {e}")
+
+                # latent μ grid (image or latent-video over latent frames)
                 if len(mu_list) > 0:
                     mu0 = mu_list[0]  # [Cz,n,H',W']
                     if is_video and mu0.shape[1] > 1:
-                        # latent video grid across n (not across image T) for a representative patch
+                        # latent video grid across n (latent frames) for a representative patch
                         frames = []
                         for t in range(mu0.shape[1]):
                             grid = make_grid_from_channels(mu0[:, t]).detach().cpu().numpy()
@@ -593,17 +747,18 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                             return out[0] if isinstance(out, list) else out
                         base = decode_patch(z_one); 
                         if base.dim() == 5: base = base.squeeze(0)
-                        base_mag = complex_mag(base.unsqueeze(0)).squeeze(0)  # [t,h,w]
+                        base_mag = complex_mag(base).squeeze(0)  # [t,h,w]
                         z2 = z_one.clone()
                         z2[0, 0, min(0, z2.shape[2]-1), z2.shape[3]//2, z2.shape[4]//2] += locality_eps
                         out = decode_patch(z2); 
                         if out.dim() == 5: out = out.squeeze(0)
-                        diff = (complex_mag(out.unsqueeze(0)).squeeze(0) - base_mag).abs()
+                        diff = (complex_mag(out).squeeze(0) - base_mag).abs()
                         t_star = int(torch.argmax(diff.sum(dim=(1,2))).item())
                         im = diff[t_star].detach().cpu().numpy()
                         im = im / (im.max() + 1e-6)
-                        iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_psf_t{t_star}.png"),
-                                    (im * 255.0).astype(np.uint8))
+                        from imageio.v2 import imwrite
+                        imwrite(os.path.join(out_dir, f"sample{n_done:03d}_psf_t{t_star}.png"),
+                                (im * 255.0).astype(np.uint8))
                     except Exception as e:
                         print(f"[viz] PSF viz skipped on sample {n_done}: {e}")
 
@@ -611,11 +766,15 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
             row = {
                 "mode": mode_known,
                 "T": int(T), "H": int(H), "W": int(W),
-                "psnr_recon": psnr_r,
+                "snr_complex": snr_c,
+                "l1_complex": l1_img,
+                "l1k_complex": l1k,
+                "lpips_middle": lpips_m,
                 "smooth_tv3d": tv,
                 "smooth_temporal_jerk": jerk,
                 **loc, **rob,
             }
+
             per_sample_rows.append(row)
             for k in acc_lists.keys():
                 if k in row and row[k] is not None:
@@ -627,15 +786,24 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
         if n_done >= max_items:
             break
 
-    # ---- Gaussianity across channels (aggregate) ----
-    if len(Z_chunks) > 0:
-        Z_all = torch.cat(Z_chunks, dim=0)  # [Npos, C]
+    # ---- Gaussianity across channels (aggregate; two-pass GLOBAL standardization) ----
+    if len(MU_chunks) > 0:
+        MU_all = torch.cat(MU_chunks, dim=0)  # [Npos, C], raw μ
+        mean = MU_all.mean(dim=0, keepdim=True)
+        std  = MU_all.std(dim=0, keepdim=True).clamp_min(1e-6)
+        Z_all = (MU_all - mean) / std                        # global per-channel Z
         gauss = channel_gaussianity_stats(Z_all)
         gauss["cov_offdiag_abs_mean"] = offdiag_cov_abs_mean(Z_all)
+
+        # --- Save channel histograms (uses globally standardized Z_all) ---
+        try:
+            save_channel_histograms(Z_all.cpu(), out_dir, max_ch=int(hist_max_ch), bins=int(hist_bins))
+        except Exception as e:
+            print(f"[viz] histogram save failed: {e}")
     else:
         gauss = {"skew_abs_mean": float("nan"), "kurtosis_mean": float("nan"),
-                 "jb_reject_rate": float("nan"), "std_mean": float("nan"),
-                 "mean_abs_mean": float("nan"), "cov_offdiag_abs_mean": float("nan")}
+                "jb_reject_rate": float("nan"), "std_mean": float("nan"),
+                "mean_abs_mean": float("nan"), "cov_offdiag_abs_mean": float("nan")}
 
     # ---- Summaries ----
     def _nm(a): return float(np.nanmean(a)) if len(a) else float("nan")
@@ -646,6 +814,7 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
     summary.update({ f"gauss/{k}": v for k, v in gauss.items() })
     summary["num_items"] = n_done
     summary["mode"] = mode_known or "unknown"
+    summary["lpips_used"] = bool(_HAS_LPIPS)
 
     # ---- Save ----
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
@@ -668,14 +837,18 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
 # ======================= CLI =======================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True, help="YAML config path")
-    ap.add_argument("--ckpt",   type=str, required=True, help="Path to checkpoint .pt (state.pt)")
+    ap.add_argument("--config", type=str, default="configs/vae.yaml", help="YAML config path")
+    ap.add_argument("--ckpt",   type=str, default="/storage/matt_models/cardiac_vae/step_0052000/state.pt", help="Path to checkpoint .pt (state.pt)")
     ap.add_argument("--out",    type=str, default="eval_out", help="Output directory")
-    ap.add_argument("--max-items", type=int, default=64)
+    ap.add_argument("--max-items", type=int, default=500, help="Max number of samples to evaluate")
     ap.add_argument("--locality-probes", type=int, default=4)
     ap.add_argument("--locality-eps", type=float, default=0.1)
     ap.add_argument("--robust-noise-sigma", type=float, default=0.02)
     ap.add_argument("--robust-phase-deg", type=float, default=5.0)
+    # NEW: visualization and histogram controls
+    ap.add_argument("--vis-max", type=int, default=5, help="Max number of samples to visualize")
+    ap.add_argument("--hist-max-ch", type=int, default=16, help="Num channels to show in Gaussianity hist figure")
+    ap.add_argument("--hist-bins", type=int, default=51, help="Bins for Gaussianity histograms")
     args = ap.parse_args()
 
     import yaml
@@ -689,7 +862,10 @@ def main():
              probes=args.locality_probes,
              locality_eps=args.locality_eps,
              noise_sigma=args.robust_noise_sigma,
-             phase_deg=args.robust_phase_deg)
+             phase_deg=args.robust_phase_deg,
+             vis_max=args.vis_max,
+             hist_max_ch=args.hist_max_ch,
+             hist_bins=args.hist_bins)
 
 if __name__ == "__main__":
     main()

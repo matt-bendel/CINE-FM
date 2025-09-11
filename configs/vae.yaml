@@ -2,8 +2,6 @@
 # CardiacVAE training (stage-aware; step-based)
 # -----------------------------
 
-debug_steps: 1550
-
 stages:
   mode: pretrain_2d   # or videos
 
@@ -12,15 +10,21 @@ train_dataset:
   args:
     root: /storage/CINE_data
     split: train
-    stage_mode: pretrain_2d  # or videos
+    stage_mode: videos  # or videos
 val_dataset:
   name: CINEDataset
   args:
     root: /storage/CINE_data
     split: val
-    stage_mode: pretrain_2d  # or videos
+    stage_mode: videos  # or videos
+test_dataset:
+  name: CINEDataset
+  args:
+    root: /storage/CINE_data
+    split: test
+    stage_mode: videos  # or videos
 dataloader:
-  train_batch_size: 4
+  train_batch_size: 8
   val_batch_size: 1
   num_workers: 8
   pin_memory: false
@@ -35,12 +39,12 @@ model:
     z_dim: 16
     dim: 128
     dim_mult: [1, 2, 4]
-    num_res_blocks: 2
-    attn_scales: []
+    num_res_blocks: 4
+    attn_scales: [128]
     dropout: 0.0
-  load_state_dict_from: '/storage/matt_models/cardiac_vae/step_0022000/state.pt'
+  load_state_dict_from: none
   strict_load: false
-  resume: true
+  resume: false
 
 # Optimization (step-based)
 optim:
@@ -75,11 +79,11 @@ loss:
     w_img: 3.0
     w_lpips: 3.0
     w_kl: 3e-6
-    # w_tvz: 1e-3
+    # w_tvz: 1e-4
     w_ortho: 1e-6
     w_tvz: 0.0
     schedules:
-      kl:     {type: linear, start_scale: 0.5, end_scale: 1.0, pct_of_steps: 0.2}
+      kl:     {type: linear, start_scale: 0.5, end_scale: 1.0, pct_of_steps: 0.1}
       tvz:    {type: linear, start_scale: 0.2, end_scale: 1.0, pct_of_steps: 0.5}
       ortho:  {type: linear, start_scale: 0.0, end_scale: 1.0, pct_of_steps: 0.5}
       lpips:  {type: cosine, start_scale: 0.5, end_scale: 1.0, pct_of_steps: 0.2}
@@ -97,7 +101,7 @@ logging:
   log_every_steps: 50
   val_every_steps: 2000
   save_every_steps: 2000
-  val_num_batches: 150
+  val_num_batches: 50
   out_dir: /storage/matt_models/cardiac_vae
   wandb_dir: /storage/matt_models/wandb
   wandb_cache_dir: /storage/matt_models/wandbcache

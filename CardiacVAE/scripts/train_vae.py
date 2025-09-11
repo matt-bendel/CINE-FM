@@ -260,8 +260,11 @@ def compute_N(data_shape, patch_size):
 
 class CardiacVAETrainer:
     def __init__(self, model: nn.Module, train_dl: DataLoader, val_dl: DataLoader, cfg: Dict[str, Any]):
+        cfg['logging']['out_dir'] = cfg['logging']['out_dir'] + f"/{cfg['stages']['mode']}"
         self.cfg = cfg
         self.model = model
+
+        self.model = torch.compile(self.model) # Can do w/ fixed shapes..
 
         # Stage
         mode = cfg["stages"]["mode"]
@@ -288,7 +291,7 @@ class CardiacVAETrainer:
         if opt_cfg.get("scheduler", {}).get("type", "none") == "cosine":
             eta_min = opt_cfg["lr"] * opt_cfg["scheduler"].get("eta_min_ratio", 0.1)
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=self.total_steps, eta_min=eta_min
+                self.optimizer, T_max=self.total_steps * 4, eta_min=eta_min
             )
 
         self.train_dl = train_dl
@@ -900,6 +903,9 @@ class CardiacVAETrainer:
 
         sse_mag_rank = torch.zeros((), device=device, dtype=torch.float32)
         cnt_mag_rank = torch.zeros((), device=device, dtype=torch.float32)
+        # For complex SNR aggregation across the whole validation set
+        energy_sig_rank = torch.zeros((), device=device, dtype=torch.float32)
+        energy_err_rank = torch.zeros((), device=device, dtype=torch.float32)
 
         logged_media    = False
         logged_latents  = False
@@ -999,6 +1005,13 @@ class CardiacVAETrainer:
                 diff = xhm - xm
                 sse_mag_rank += (diff * diff).sum().to(device)
                 cnt_mag_rank += float(xm.numel())
+
+                # -------- SNR accum on complex signal (real/imag jointly) --------
+                # SNR(xhat,x) [dB] = 10*log10( ||x||^2 / ||xhat-x||^2 )
+                # Here ||·|| is the ℓ2 norm over the complex field => sum over real/imag channels.
+                err = (xhat - x)
+                energy_sig_rank += (x * x).sum().to(device)
+                energy_err_rank += (err * err).sum().to(device)
 
                 # -------- One-time visuals --------
                 if self.accelerator.is_main_process and not logged_media:
@@ -1129,6 +1142,14 @@ class CardiacVAETrainer:
         psnr    = 10.0 * torch.log10((max_I * max_I) / mse_mag.clamp_min(1e-12))
         global_means["psnr_mag"] = float(psnr.detach().cpu().item())
 
+        # -------- finalize complex SNR over entire validation set --------
+        sig_all = self.accelerator.gather_for_metrics(energy_sig_rank)
+        err_all = self.accelerator.gather_for_metrics(energy_err_rank)
+        sig_sum = sig_all.sum().clamp_min(1e-12)
+        err_sum = err_all.sum().clamp_min(1e-12)
+        snr_db  = 10.0 * torch.log10(sig_sum / err_sum)
+        global_means["snr_complex"] = float(snr_db.detach().cpu().item())
+
         # ---------------- logging ----------------
         if self.accelerator.is_main_process:
             wandb.log({f"val/{k}": v for k, v in global_means.items()}, step=self.global_step)
@@ -1209,6 +1230,10 @@ def main(config_path: str):
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
+    cfg['train_dataset']['args']['stage_mode'] = cfg['stages']['mode']
+    cfg['val_dataset']['args']['stage_mode'] = cfg['stages']['mode']
+    cfg['test_dataset']['args']['stage_mode'] = cfg['stages']['mode']
+
     cfg['logging']['run_name'] = cfg['logging']['run_name'] + "_" + cfg['stages']['mode']
     torch.manual_seed(42)
 
@@ -1229,13 +1254,10 @@ def main(config_path: str):
         if not strict_load:
             print(f"[VAE] missing={len(missing)} unexpected={len(unexpected)}")
 
+    # Print total number of model parameters
+    print(f"[VAE] total number of model parameters: {sum(p.numel() for p in model.parameters())}")
+
     trainer = CardiacVAETrainer(model, train_dl, val_dl, cfg)
-
-    # if cfg["model"].get("calibrate_scale", True):
-        # nb = int(cfg["model"].get("calib_batches", 50))
-        # use_train = bool(cfg["model"].get("calib_use_train", True))
-        # trainer.calibrate_latent_scale(num_batches=nb, use_train=use_train)
-
     trainer.train()
 
 if __name__ == "__main__":
