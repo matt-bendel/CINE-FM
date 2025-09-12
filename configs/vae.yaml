@@ -3,7 +3,7 @@
 # -----------------------------
 
 stages:
-  mode: pretrain_2d   # or videos
+  mode: videos   # or videos
 
 train_dataset:
   name: CINEDataset
@@ -11,6 +11,7 @@ train_dataset:
     root: /storage/CINE_data
     split: train
     stage_mode: videos  # or videos
+    fixed_train_L: 7
 val_dataset:
   name: CINEDataset
   args:
@@ -24,9 +25,9 @@ test_dataset:
     split: test
     stage_mode: videos  # or videos
 dataloader:
-  train_batch_size: 8
+  train_batch_size: 2
   val_batch_size: 1
-  num_workers: 8
+  num_workers: 16
   pin_memory: false
   shuffle: true
 
@@ -37,12 +38,12 @@ model:
   args:
     in_channels: 2
     z_dim: 16
-    dim: 128
-    dim_mult: [1, 2, 4]
+    dim: 256
+    dim_mult: [1, 2] # [1, 2, 4] for 4x spatial downsampling, [1, 2] for 2x spatial downsampling
     num_res_blocks: 4
-    attn_scales: [128]
+    attn_scales: []
     dropout: 0.0
-  load_state_dict_from: none
+  load_state_dict_from: '/storage/matt_models/cardiac_vae/pretrain_2d/step_0065000/state.pt'
   strict_load: false
   resume: false
 
@@ -63,7 +64,8 @@ loss:
   pretrain_2d:
     complex_l1: true
     use_lpips: true
-    w_img: 3.0
+    w_l1: 3.0
+    w_mse: 100.0
     w_lpips: 3.0
     w_kl: 3e-6
     w_ortho: 1e-6
@@ -76,9 +78,10 @@ loss:
     complex_l1: true
     use_lpips: true
     lpips_frames: 'all'
-    w_img: 3.0
+    w_l1: 3.0
+    w_mse: 100.0
     w_lpips: 3.0
-    w_kl: 3e-6
+    w_kl: 3e-5
     # w_tvz: 1e-4
     w_ortho: 1e-6
     w_tvz: 0.0
@@ -91,7 +94,7 @@ loss:
 validation:
   patch_h: 80
   patch_w: 80
-  patch_t: 11      # temporal size (videos). For pretrain_2d we use 1.
+  patch_t: 9      # temporal size (videos). For pretrain_2d we use 1.
   patch_batch: 32  # how many patches to run through the VAE at once
 
 # Logging / Validation / Checkpoints
@@ -99,9 +102,9 @@ logging:
   project: cardiac-vae
   run_name: wan_vae_complex_l1_lpips_kl_11x80x80_patches
   log_every_steps: 50
-  val_every_steps: 2000
-  save_every_steps: 2000
-  val_num_batches: 50
+  val_every_steps: 5000
+  save_every_steps: 5000
+  val_num_batches: 20
   out_dir: /storage/matt_models/cardiac_vae
   wandb_dir: /storage/matt_models/wandb
   wandb_cache_dir: /storage/matt_models/wandbcache

@@ -1,2 +1,4 @@
 __pycache__/
 eval_out/
+eval_out_ema/
+__pycache__

@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+from typing import List, Tuple, Sequence
 
 import torch
 import torch.cuda.amp as amp
@@ -525,7 +526,8 @@ class WanVAE_(nn.Module):
         self.attn_scales = attn_scales
         self.temperal_downsample = temperal_downsample
         # self.temperal_upsample = temperal_downsample[::-1]
-        self.temperal_upsample = [False, True]
+        # self.temperal_upsample = [False, True] # for 4x spatial downsampling
+        self.temperal_upsample = [True] # for 2x spatial downsampling
 
         self.temporal_downsample_factor = 2
         if self.temperal_downsample[1]:
@@ -541,11 +543,7 @@ class WanVAE_(nn.Module):
         self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_upsample, dropout)
 
-    def forward(self, x):
-        mu, log_var = self.encode(x)
-        z = self.reparameterize(mu, log_var)
-        x_recon = self.decode(z)
-        return x_recon, mu, log_var
+    # -------------------- core encode/decode (streaming across time) --------------------
 
     def _encode_one(self, x, scale):
         """
@@ -628,43 +626,113 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return out
 
-    # ---------- public API (now accept tensor or list) ----------
+    # -------------------- list packing helpers --------------------
+
+    @staticmethod
+    def _ensure_5d(x: torch.Tensor) -> torch.Tensor:
+        # Accept [C,T,H,W] or [B,C,T,H,W]
+        if x.dim() == 4:
+            return x.unsqueeze(0)
+        elif x.dim() == 5:
+            return x
+        else:
+            raise ValueError(f"Expected 4D/5D tensor, got {x.dim()}D")
+
+    @staticmethod
+    def _maybe_pack(xs: Sequence[torch.Tensor]) -> Tuple[bool, torch.Tensor, List[int]]:
+        """
+        Try to concatenate a sequence of 4D/5D tensors into a single 5D batch.
+        Returns: (packed, tensor_or_dummy, batch_sizes)
+        - packed=False => fall back to per-item
+        - when packed=True, batch_sizes holds the original batch size of each item (usually all 1s)
+        """
+        xs5 = [WanVAE_._ensure_5d(x) for x in xs]
+        # Check same shape for non-batch dims
+        shape_ref = xs5[0].shape[1:]
+        for x in xs5[1:]:
+            if x.shape[1:] != shape_ref:
+                return False, xs5[0], [x.shape[0] for x in xs5]
+        # Shapes match; pack along batch
+        b_sizes = [x.shape[0] for x in xs5]
+        x_cat = torch.cat(xs5, dim=0)
+        return True, x_cat, b_sizes
+
+    @staticmethod
+    def _unpack_batch(y: torch.Tensor, b_sizes: List[int]) -> List[torch.Tensor]:
+        """
+        Split a batched result tensor back into a list of tensors with their original batch sizes.
+        """
+        outs = []
+        s = 0
+        for b in b_sizes:
+            outs.append(y[s:s+b])
+            s += b
+        return outs
+
+    @staticmethod
+    def _split_pairs(mu: torch.Tensor, logv: torch.Tensor, b_sizes: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        mus = WanVAE_._unpack_batch(mu, b_sizes)
+        logvs = WanVAE_._unpack_batch(logv, b_sizes)
+        return list(zip(mus, logvs))
+
+    # -------------------- public encode/decode (now batch-aware for lists) --------------------
+
     def encode(self, xs, scale):
         """
-        xs: Tensor [B, C, T, H, W] OR list of Tensors [C, T, H, W] or [B, C, T, H, W] (varying sizes allowed).
-        Returns:
-          - if input was Tensor: (mu, log_var)
-          - if input was list: list of (mu, log_var) with per-item shapes
+        xs: Tensor [B, C, T, H, W] OR list of Tensors (each 4D/5D).
+        If list and all shapes match (non-batch dims), we pack -> single batched encode,
+        then split back to a list (preserving leading batch dims per item).
         """
         if isinstance(xs, (list, tuple)):
-            out = []
-            for x in xs:
-                if x.dim() == 4:  # [C,T,H,W] -> add batch dim
-                    x = x.unsqueeze(0)
-                mu, log_var = self._encode_one(x, scale)
-                out.append((mu, log_var))
-            return out
+            xs = list(xs)
+            if len(xs) == 0:
+                return []
+            can_pack, x_cat, b_sizes = self._maybe_pack(xs)
+            if can_pack:
+                mu, logv = self._encode_one(x_cat, scale)
+                return self._split_pairs(mu, logv, b_sizes)
+            else:
+                out = []
+                for x in xs:
+                    x5 = self._ensure_5d(x)
+                    mu, logv = self._encode_one(x5, scale)
+                    out.append((mu, logv))
+                return out
         else:
-            # single tensor path
-            return self._encode_one(xs, scale)
+            x5 = self._ensure_5d(xs)
+            return self._encode_one(x5, scale)
 
     def decode(self, zs, scale):
         """
-        zs: Tensor [B, z_dim, n, H/8, W/8] OR list of Tensors with varying (n,H,W).
-        Returns:
-          - if input was Tensor: x_hat Tensor
-          - if input was list: list of x_hat Tensors
+        zs: Tensor [B, z_dim, n, H', W'] OR list of Tensors (each 4D/5D).
+        If list and shapes match (non-batch dims), we pack -> single batched decode,
+        then split back to a list (preserving leading batch dims per item).
         """
         if isinstance(zs, (list, tuple)):
-            outs = []
-            for z in zs:
-                if z.dim() == 4:  # [z_dim, n, H/8, W/8] -> add batch dim
-                    z = z.unsqueeze(0)
-                out = self._decode_one(z, scale)
-                outs.append(out)
-            return outs
+            zs = list(zs)
+            if len(zs) == 0:
+                return []
+            # ensure 5D and try to pack
+            zs5 = [self._ensure_5d(z) for z in zs]
+            # Check same latent shape excluding batch
+            ref = zs5[0].shape[1:]
+            for z in zs5[1:]:
+                if z.shape[1:] != ref:
+                    # fallback: per item
+                    outs = []
+                    for z_i in zs5:
+                        out_i = self._decode_one(z_i, scale)
+                        outs.append(out_i)
+                    return outs
+            b_sizes = [z.shape[0] for z in zs5]
+            z_cat = torch.cat(zs5, dim=0)
+            x_cat = self._decode_one(z_cat, scale)
+            return self._unpack_batch(x_cat, b_sizes)
         else:
-            return self._decode_one(zs, scale)
+            z5 = self._ensure_5d(zs)
+            return self._decode_one(z5, scale)
+
+    # -------------------- misc --------------------
 
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
@@ -672,17 +740,17 @@ class WanVAE_(nn.Module):
         return eps * std + mu
 
     def sample(self, imgs, deterministic=False):
-        mu, log_var = self.encode(imgs)
+        mu, log_var = self.encode(imgs, scale=[0.0, 1.0])
         if deterministic:
             return mu
-        std = torch.exp(0.5 * log_var.clamp(-30.0, 20.0))
+        std = torch.exp(0.5 * log_var.clamp(-20.0, 20.0))
         return mu + std * torch.randn_like(std)
 
     def clear_cache(self):
         self._conv_num = count_conv3d(self.decoder)
         self._conv_idx = [0]
         self._feat_map = [None] * self._conv_num
-        #cache encode
+        # cache encode
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
@@ -695,6 +763,13 @@ class CardiacVAE(WanVAE_):
     - Temporal compression: 2x (causal; 3 input frames -> 2 latent frames)
     - Latents are encouraged to be Gaussian across channels at each (t,h,w),
       while allowing spatial/temporal correlations.
+
+    NOTE:
+      * Accepts either a Tensor or a list of Tensors (ragged batches).
+      * When given a list whose elements all share the same (C,T,H,W),
+        this implementation **packs** them into one big batch for a single
+        forward pass, then **unpacks** to lists again — so your training
+        loop stays unchanged but gets the throughput of batched compute.
     """
     def __init__(self,
                  in_channels: int = 2,     # complex MRI: [real, imag]
@@ -702,7 +777,7 @@ class CardiacVAE(WanVAE_):
                  dim: int = 128,
                  dim_mult=(1, 2, 4),
                  num_res_blocks: int = 3,
-                 attn_scales=(128),
+                 attn_scales=(128,),
                  dropout: float = 0.0):
         # Only 2x temporal downsample (first stage); spatial 4x via dim_mult
         temperal_downsample = [True, False, False]
@@ -736,39 +811,32 @@ class CardiacVAE(WanVAE_):
         self.scale_mean = mean.to(device)
         self.scale_invstd = (1.0 / std.clamp_min(1e-3)).to(device)
 
-    # Override encode/decode thin wrappers to pass scale and apply whiteners
+    # Override encode/decode thin wrappers to pass scale and keep batch-packing behavior
     def encode(self, xs):
         """
-        Accepts Tensor or list of Tensors. Applies parent streaming encode with scaling,
-        then applies 1x1x1 whitening to (mu, log_var).
+        Accepts Tensor or list of Tensors. Uses parent streaming encode with scaling.
+        Keeps list-in/list-out interface but batches internally when shapes match.
         """
         scale = [self.scale_mean, self.scale_invstd]
-
-        if isinstance(xs, (list, tuple)):
-            pairs = super().encode(xs, scale=scale)  # list of (mu, log_var)
-            out = []
-            for (mu, log_var) in pairs:
-                out.append((mu, log_var))
-            return out
-        else:
-            mu, log_var = super().encode(xs, scale=scale)
-            return mu, log_var
+        return super().encode(xs, scale=scale)
 
     def decode(self, zs):
         """
-        Accepts Tensor or list of Tensors and uses parent decode with scaling.
-        (No whitening here.)
+        Accepts Tensor or list of Tensors. Uses parent streaming decode with scaling.
+        Keeps list-in/list-out interface but batches internally when shapes match.
         """
         scale = [self.scale_mean, self.scale_invstd]
         return super().decode(zs, scale=scale)
 
-    # Add this to CardiacVAE
     @torch.no_grad()
     def encode_raw_mu(self, x):
-        # Bypass scaling: pass scale=[0,1] and skip whiteners
-        # We call the parent encode directly and DO NOT apply self.mu_whitener/logv_whitener
-        mu, log_var = super(CardiacVAE, self).encode(x, scale=[torch.zeros(self.z_dim, device=x.device),
-                                                            torch.ones(self.z_dim, device=x.device)])
+        """
+        Bypass scaling: pass scale=[0,1] and skip whitening. Accepts Tensor only.
+        """
+        mu, log_var = super(CardiacVAE, self).encode(
+            x, scale=[torch.zeros(self.z_dim, device=x.device),
+                      torch.ones(self.z_dim, device=x.device)]
+        )
         return mu  # [B, C=z_dim, T', H', W']
 
     def forward(self, xs, op: str | None = None):
@@ -786,12 +854,12 @@ class CardiacVAE(WanVAE_):
         if op == "decode":
             return self.decode(xs)
 
-        # Full end-to-end pass (single forward for DDP)
+        # Full end-to-end pass
         pairs = self.encode(xs)  # tensor or list of (mu, logv)
 
         # Reparameterize (preserve list/tensor structure)
         def _reparam(mu, logv):
-            logv = logv.clamp(-30, 20)
+            logv = logv.clamp(-20.0, 20.0)
             std = torch.exp(0.5 * logv)
             return mu + std * torch.randn_like(std)
 

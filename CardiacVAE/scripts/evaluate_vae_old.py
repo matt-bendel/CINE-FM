@@ -15,8 +15,7 @@ if LAUNCH_ROOT not in sys.path:
 
 from data.cine_dataset import CINEDataset  # returns [2,1,H,W] (pretrain_2d) or [2,L,H,W] (videos)
 
-# ======================= Patch helpers =======================
-# (legacy helpers kept for compatibility; main loop uses the new fixed-stride OA)
+# ======================= Patch helpers (mirrors training) =======================
 def compute_stride_and_n_patches(D, P, extra_patch_num=0):
     n_patches = 1
     while True:
@@ -51,69 +50,98 @@ def compute_strides_and_N(data_shape, patch_size=(80, 80, 11), extra_patch_num=(
     N = torch.prod(torch.tensor(n_patches_list))
     return tuple(strides), N.item(), tuple(n_patches_list)
 
-# --- NEW fixed 50% overlap + Hann window helpers (validation-style) ---
-def _hann3d(t: int, h: int, w: int, device) -> torch.Tensor:
-    wt = torch.hann_window(t, periodic=False, device=device).view(t, 1, 1) if t > 1 else torch.ones((t, 1, 1), device=device)
-    wh = torch.hann_window(h, periodic=False, device=device).view(1, h, 1)
-    ww = torch.hann_window(w, periodic=False, device=device).view(1, 1, w)
-    return wt * wh * ww  # [t,h,w]
+def patchify(data: torch.Tensor, patch_size):
+    data_shape = data.shape
+    strides, N, n_patches_list = compute_strides_and_N(data_shape, patch_size)
+    S0, S1, S2 = strides
+    P0, P1, P2 = patch_size
+    n_patches_d0, n_patches_d1, n_patches_d2 = n_patches_list
 
-def _patchify_fixed_stride(vol_thw: torch.Tensor, patch_size: Tuple[int,int,int], strides: Tuple[int,int,int]):
-    # vol_thw: [T,H,W] (or [1,H,W] when T==1)
+    patches = torch.zeros((N, P0, P1, P2), dtype=data.dtype, device=data.device)
+    patch_idx = 0
+
+    for i in range(n_patches_d0):
+        start0 = i * S0
+        end0 = start0 + P0
+        actual_end0 = min(end0, data_shape[0])
+        for j in range(n_patches_d1):
+            start1 = j * S1
+            end1 = start1 + P1
+            actual_end1 = min(end1, data_shape[1])
+            for k in range(n_patches_d2):
+                start2 = k * S2
+                end2 = start2 + P2
+                actual_end2 = min(end2, data_shape[2])
+                patch = data[start0:actual_end0, start1:actual_end1, start2:actual_end2]
+                padded_patch = torch.zeros((P0, P1, P2), dtype=data.dtype, device=data.device)
+                s0 = actual_end0 - start0
+                s1 = actual_end1 - start1
+                s2 = actual_end2 - start2
+                padded_patch[:s0, :s1, :s2] = patch
+                patches[patch_idx] = padded_patch
+                patch_idx += 1
+
+    return patches, strides
+
+def depatchify(patches: torch.Tensor, data_shape: tuple, patch_size: tuple, strides: tuple):
+    D0, D1, D2 = data_shape
     P0, P1, P2 = patch_size
     S0, S1, S2 = strides
-    T_, H_, W_ = vol_thw.shape
-    n0 = max(1, math.ceil((T_ - P0) / S0) + 1)
-    n1 = max(1, math.ceil((H_ - P1) / S1) + 1)
-    n2 = max(1, math.ceil((W_ - P2) / S2) + 1)
-    N = n0 * n1 * n2
 
-    patches = torch.zeros((N, P0, P1, P2), dtype=vol_thw.dtype, device=vol_thw.device)
-    idx = 0
+    device = patches.device
+    dtype  = patches.dtype
+
+    out_num = torch.zeros(data_shape, dtype=dtype, device=device)
+    out_den = torch.zeros(data_shape, dtype=torch.float32, device=device)
+
+    n0 = max(1, ceil((D0 - P0) / S0) + 1)
+    n1 = max(1, ceil((D1 - P1) / S1) + 1)
+    n2 = max(1, ceil((D2 - P2) / S2) + 1)
+
+    expected_N = n0 * n1 * n2
+    if patches.shape[0] != expected_N:
+        raise ValueError(f"patches.shape[0]={patches.shape[0]} != expected {expected_N} (= {n0}*{n1}*{n2})")
+
+    O0 = max(0, P0 - S0); O1 = max(0, P1 - S1); O2 = max(0, P2 - S2)
+
+    def axis_weights(L_eff: int, idx: int, n: int, O: int) -> torch.Tensor:
+        has_prev, has_next = (idx > 0), (idx < n - 1)
+        L_left  = min(O if has_prev else 0, L_eff)
+        L_right = min(O if has_next else 0, L_eff)
+        if L_left + L_right > L_eff:
+            if L_left > 0 and L_right > 0:
+                total = L_left + L_right
+                L_left_new  = max(1, int(round(L_eff * (L_left / total))))
+                L_right_new = L_eff - L_left_new
+                L_left, L_right = L_left_new, L_right_new
+            else:
+                L_left  = min(L_left,  L_eff)
+                L_right = L_eff - L_left
+        w = torch.ones(L_eff, dtype=torch.float32, device=device)
+        if L_left > 0:
+            w[:L_left] = 0.5 if L_left == 1 else torch.linspace(0.0, 1.0, steps=L_left, device=device)
+        if L_right > 0:
+            w[-L_right:] = 0.5 if L_right == 1 else torch.linspace(1.0, 0.0, steps=L_right, device=device)
+        return w
+
+    patch_idx = 0
     for i in range(n0):
-        t0 = i * S0; t1 = min(t0 + P0, T_); s0 = t1 - t0
+        start0 = i * S0; end0 = min(start0 + P0, D0)
+        s0, ps0, w0 = slice(start0, end0), slice(0, end0 - start0), axis_weights(end0 - start0, i, n0, O0)
         for j in range(n1):
-            y0 = j * S1; y1 = min(y0 + P1, H_); s1 = y1 - y0
+            start1 = j * S1; end1 = min(start1 + P1, D1)
+            s1, ps1, w1 = slice(start1, end1), slice(0, end1 - start1), axis_weights(end1 - start1, j, n1, O1)
             for k in range(n2):
-                x0 = k * S2; x1 = min(x0 + P2, W_); s2 = x1 - x0
-                patch = torch.zeros((P0, P1, P2), dtype=vol_thw.dtype, device=vol_thw.device)
-                patch[:s0, :s1, :s2] = vol_thw[t0:t1, y0:y1, x0:x1]
-                patches[idx] = patch
-                idx += 1
-    return patches  # [N,t,h,w]
+                start2 = k * S2; end2 = min(start2 + P2, D2)
+                s2, ps2, w2 = slice(start2, end2), slice(0, end2 - start2), axis_weights(end2 - start2, k, n2, O2)
+                w = (w0[:, None, None] * w1[None, :, None] * w2[None, None, :])
+                patch = patches[patch_idx][ps0, ps1, ps2]
+                out_num[s0, s1, s2] += patch * w.to(dtype)
+                out_den[s0, s1, s2] += w
+                patch_idx += 1
 
-def _depatchify_fixed_stride(patches: torch.Tensor, data_shape: Tuple[int,int,int],
-                             patch_size: Tuple[int,int,int], strides: Tuple[int,int,int],
-                             window_3d: torch.Tensor):
-    # patches: [N, P0,P1,P2]; window_3d: [P0,P1,P2]
-    P0, P1, P2 = patch_size
-    S0, S1, S2 = strides
-    T_, H_, W_ = data_shape
-    n0 = max(1, math.ceil((T_ - P0) / S0) + 1)
-    n1 = max(1, math.ceil((H_ - P1) / S1) + 1)
-    n2 = max(1, math.ceil((W_ - P2) / S2) + 1)
-    expected = n0 * n1 * n2
-    if int(patches.shape[0]) != expected:
-        raise RuntimeError(f"depatchify: N={patches.shape[0]} but expected {expected} for shape={data_shape}, P={patch_size}, S={strides}")
-
-    out_num = torch.zeros((T_, H_, W_), dtype=patches.dtype, device=patches.device)
-    out_den = torch.zeros((T_, H_, W_), dtype=torch.float32, device=patches.device)
-
-    idx = 0
-    for i in range(n0):
-        t0 = i * S0; t1 = min(t0 + P0, T_); s0 = t1 - t0
-        for j in range(n1):
-            y0 = j * S1; y1 = min(y0 + P1, H_); s1 = y1 - y0
-            for k in range(n2):
-                x0 = k * S2; x1 = min(x0 + P2, W_); s2 = x1 - x0
-                w = window_3d[:s0, :s1, :s2]
-                p = patches[idx][:s0, :s1, :s2]
-                out_num[t0:t1, y0:y1, x0:x1] += (p * w).to(out_num.dtype)
-                out_den[t0:t1, y0:y1, x0:x1] += w.to(out_den.dtype)
-                idx += 1
-
-    out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
-    return (out_num / out_den.to(out_num.dtype))  # [T,H,W]
+    out_den[out_den == 0] = 1.0
+    return out_num / out_den.to(dtype)
 
 def ragged_collate(batch):  # keep ragged batch (list of tensors)
     return batch
@@ -131,7 +159,7 @@ def snr_complex(x: torch.Tensor, xhat: torch.Tensor, eps: float = 1e-12) -> floa
     """
     signal_energy = x.pow(2).sum().item()
     noise_energy  = (xhat - x).pow(2).sum().item()
-    return 10.0 * math.log10(max(signal_energy, eps) / max(noise_energy, eps))
+    return 10.0 * math.log10(signal_energy / noise_energy)
 
 @torch.no_grad()
 def fft2c(x: torch.Tensor) -> torch.Tensor:  # [2,T,H,W] -> [2,T,H,W] in k-space
@@ -144,6 +172,15 @@ def fft2c(x: torch.Tensor) -> torch.Tensor:  # [2,T,H,W] -> [2,T,H,W] in k-space
 def charb_l1(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> float:
     diff = x - y
     return (diff.pow(2) + eps * eps).sqrt().mean().item()
+
+@torch.no_grad()
+def psnr_mag(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> float:
+    xm, ym = complex_mag(x), complex_mag(y)
+    mse = (xm - ym).pow(2).mean().item()
+    if mse <= eps:
+        return 99.0
+    max_I = math.sqrt(2.0)  # safe bound for |complex|
+    return 10.0 * math.log10((max_I * max_I) / mse)
 
 @torch.no_grad()
 def gaussian_phase_rotate(x: torch.Tensor, theta_rad: float) -> torch.Tensor:
@@ -203,21 +240,6 @@ def save_video_from_1t(frames_1t_hw: torch.Tensor, path: str, fps: int = 7):
     return path
 
 @torch.no_grad()
-def to_uint8_abs(img_1hw: torch.Tensor, cap: float = 0.1) -> np.ndarray:
-    """
-    Absolute (fixed-range) rendering for error maps.
-    img_1hw: [1,H,W] nonnegative (we'll clamp)
-    cap: values >= cap map to white; no percentile stretching.
-    """
-    f = img_1hw.detach().float().cpu()
-    f = torch.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0)
-    f = f.clamp_min_(0.0)
-    cap = max(float(cap), 1e-8)
-    g = (f / cap).clamp_(0, 1)
-    g = (g * 255.0).round().to(torch.uint8).squeeze(0)
-    return g.numpy()
-
-@torch.no_grad()
 def save_error_visuals(x: torch.Tensor, xhat: torch.Tensor, out_dir: str, sample_id: int, is_video: bool):
     """
     Save error maps:
@@ -229,10 +251,12 @@ def save_error_visuals(x: torch.Tensor, xhat: torch.Tensor, out_dir: str, sample
     xm   = complex_mag(x)      # [1,T,H,W]
     xhm  = complex_mag(xhat)   # [1,T,H,W]
     err_mag  = (xm - xhm).abs()                # [1,T,H,W]
+ 
     if is_video:
         mid = int(xm.shape[1] // 2)
         iio.imwrite(os.path.join(out_dir, f"sample{sample_id:03d}_errmag_mid.png"),
                     to_uint8_abs(err_mag[:, mid]))
+        # full error videos
         save_video_from_1t(err_mag,  os.path.join(out_dir, f"sample{sample_id:03d}_errmag.mp4"),  fps=7)
     else:
         iio.imwrite(os.path.join(out_dir, f"sample{sample_id:03d}_errmag.png"),
@@ -283,6 +307,10 @@ def offdiag_cov_abs_mean(mu_all: torch.Tensor) -> float:
     return off.abs().mean().item()
 
 def save_channel_histograms(Z_all_cpu: torch.Tensor, out_dir: str, max_ch: int = 16, bins: int = 51):
+    """
+    Z_all_cpu: [Npos, C] standardized per-channel (zero-mean/unit-std within-sample already applied)
+    Saves a grid of histograms with N(0,1) overlay to visually assess Gaussianity.
+    """
     try:
         import matplotlib.pyplot as plt
     except Exception as e:
@@ -305,6 +333,7 @@ def save_channel_histograms(Z_all_cpu: torch.Tensor, out_dir: str, max_ch: int =
         ax.set_title(f"ch {i}", fontsize=8)
         ax.set_xlim(-4.0, 4.0)
         ax.set_yticks([])
+    # hide unused
     for j in range(k, rows*cols):
         r, c = divmod(j, cols)
         axes[r][c].axis("off")
@@ -317,11 +346,16 @@ def save_channel_histograms(Z_all_cpu: torch.Tensor, out_dir: str, max_ch: int =
 # ======================= Locality (decoder PSF) =======================
 @torch.no_grad()
 def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: int = 4) -> Dict[str, float]:
+    """
+    decoder_fn: callable(Z)->patch output [2,t,h,w] or [1,2,t,h,w]
+    z: [1,Cz,n,H',W'] (one patch latent)
+    Returns temporal std (frames) and spatial RMS radius of |Δx|.
+    """
     device = z.device
     out0 = decoder_fn(z)
-    if isinstance(out0, list):
+    if isinstance(out0, list): 
         out0 = out0[0]
-    if out0.dim() == 5:
+    if out0.dim() == 5: 
         out0 = out0.squeeze(0)  # -> [2,t,h,w]
 
     base_mag = complex_mag(out0).squeeze(0)  # [t,h,w]
@@ -340,9 +374,9 @@ def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: 
         z2 = z.clone()
         z2[0, c, tt, h, w] = z2[0, c, tt, h, w] + eps
         out = decoder_fn(z2)
-        if isinstance(out, list):
+        if isinstance(out, list): 
             out = out[0]
-        if out.dim() == 5:
+        if out.dim() == 5: 
             out = out.squeeze(0)
 
         diff = (complex_mag(out).squeeze(0) - base_mag).abs()  # [t,h,w]
@@ -356,14 +390,15 @@ def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: 
 
         t_star = int(torch.argmax(e_t).item())
 
-        E = diff[t_star]**2
+        E = diff[t_star]**2          # energy
         E_sum = E.sum() + 1e-12
         e_hw = (E / E_sum)
 
+        # Optional robust trimming (keep e.g. 99% of the energy):
         keep = 0.99
         flat = torch.sort(E.flatten(), descending=True).values
         th = flat.cumsum(0)
-        th = flat[(th <= keep * E_sum).sum().clamp(min=1)-1]
+        th = flat[(th <= keep * E_sum).sum().clamp(min=1)-1]  # threshold at 99% cum energy
         mask = (E >= th)
         e_hw = (E * mask) / (E * mask).sum().clamp_min(1e-12)
         
@@ -381,35 +416,33 @@ def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: 
 def robustness_metrics_full_pipeline(model, x_full: torch.Tensor, patch_size, patch_bs: int,
                                      noise_sigma: float = 0.02, phase_deg: float = 5.0) -> Dict[str, float]:
     """
-    Measures robustness through the SAME (new) fixed-stride Hann OA patchify->model->depatchify pipeline.
-    Latent change uses the concatenated deterministic μ vectors (no sampling).
+    Measures robustness through the SAME patchify->model->depatchify pipeline.
+    Latent change is based on concatenating all patch μ vectors (deterministic μ-probe).
     """
     device = x_full.device
     _, T, H, W = x_full.shape
     P_t, P_h, P_w = patch_size
 
     def _forward_full(x):
-        S0 = max(1, P_t // 2); S1 = max(1, P_h // 2); S2 = max(1, P_w // 2)
-        W3D = _hann3d(P_t if T > 1 else 1, P_h, P_w, x.device)
-        r_p = _patchify_fixed_stride(x[0], (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2))
-        i_p = _patchify_fixed_stride(x[1], (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2))
+        r_p, strides = patchify(x[0], patch_size=(P_t if T>1 else 1, P_h, P_w))
+        i_p, _       = patchify(x[1], patch_size=(P_t if T>1 else 1, P_h, P_w))
         Np = int(r_p.shape[0])
         patches = [ torch.stack((r_p[n], i_p[n]), dim=0).to(device) for n in range(Np) ]
-
         xhat_list, mu_list = [], []
         for i in range(0, Np, patch_bs):
-            chunk = patches[i:i+patch_bs]                 # list of [2,t,h,w]
-            enc_pairs = model(chunk, op="encode")         # list of (mu, logv)
-            mus = [mu for (mu, _lv) in enc_pairs]
-            xhats = model.decode(mus)                     # list of [B=1,2,t,h,w]
+            chunk = patches[i:i+patch_bs]
+            out = model(chunk)  # -> (xhats, mus, logvs, zs)
+            if isinstance(out, (list, tuple)) and len(out) >= 2:
+                xhats, mus = out[0], out[1]
+            else:
+                raise RuntimeError("Model forward must return (xhats, mus, logvs, zs)")
             for xh, mu in zip(xhats, mus):
                 xhat_list.append(xh.squeeze(0))
                 mu_list.append(mu.squeeze(0))
-
         r_rec = torch.stack([xh[0] for xh in xhat_list], dim=0)
         i_rec = torch.stack([xh[1] for xh in xhat_list], dim=0)
-        xhat_r = _depatchify_fixed_stride(r_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2), W3D)
-        xhat_i = _depatchify_fixed_stride(i_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2), W3D)
+        xhat_r = depatchify(r_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), strides)
+        xhat_i = depatchify(i_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), strides)
         xhat   = torch.stack((xhat_r, xhat_i), dim=0)
         return xhat, mu_list
 
@@ -431,7 +464,7 @@ def robustness_metrics_full_pipeline(model, x_full: torch.Tensor, patch_size, pa
         den = zvec0.pow(2).sum().sqrt().clamp_min(1e-6)
         return (num / den).item()
 
-    def _snr(xp):
+    def _psnr(xp):
         xh, _ = _forward_full(xp)
         return snr_complex(x_full, xh)
 
@@ -439,10 +472,11 @@ def robustness_metrics_full_pipeline(model, x_full: torch.Tensor, patch_size, pa
         "robust_latent_relchange_noise": _rel_latent_change(xn),
         "robust_latent_relchange_phase": _rel_latent_change(xp),
         "robust_latent_relchange_roll":  _rel_latent_change(xr),
-        "robust_snr_noise": _snr(xn),
-        "robust_snr_phase": _snr(xp),
-        "robust_snr_roll":  _snr(xr),
+        "robust_snr_noise": _psnr(xn),
+        "robust_snr_phase": _psnr(xp),
+        "robust_snr_roll":  _psnr(xr),
     }
+
 
 # ======================= Optional LPIPS =======================
 _HAS_LPIPS = False
@@ -458,14 +492,15 @@ except Exception:
 
 @torch.no_grad()
 def _to_lpips_img(mag_1hw: torch.Tensor) -> torch.Tensor:
-    cap = math.sqrt(2.0)  # safe bound for |complex|
+    # Map magnitude to [-1,1] with a fixed cap (<= sqrt(2))
+    cap = math.sqrt(2.0)
     x = torch.nan_to_num(mag_1hw, nan=0.0, posinf=0.0, neginf=0.0)
     x = (x / cap).clamp_(0, 1) * 2.0 - 1.0
     return x.repeat(3, 1, 1).unsqueeze(0)
 
 @torch.no_grad()
 def lpips_on_full(x: torch.Tensor, xhat: torch.Tensor) -> float:
-    if not _HAS_LPIPS:
+    if not _HAS_LPIPS: 
         return float("nan")
     xm  = complex_mag(x)
     xhm = complex_mag(xhat)
@@ -476,6 +511,21 @@ def lpips_on_full(x: torch.Tensor, xhat: torch.Tensor) -> float:
     A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
     B = torch.nan_to_num(B, nan=0.0, posinf=0.0, neginf=0.0)
     return float(_LPIPS_NET(A, B).mean().item())
+
+@torch.no_grad()
+def to_uint8_abs(img_1hw: torch.Tensor, cap: float = 0.1) -> np.ndarray:
+    """
+    Absolute (fixed-range) rendering for error maps.
+    img_1hw: [1,H,W] nonnegative (we'll clamp)
+    cap: values >= cap map to white; no percentile stretching.
+    """
+    f = img_1hw.detach().float().cpu()
+    f = torch.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0)
+    f = f.clamp_min_(0.0)
+    cap = max(float(cap), 1e-8)
+    g = (f / cap).clamp_(0, 1)
+    g = (g * 255.0).round().to(torch.uint8).squeeze(0)
+    return g.numpy()
 
 # ======================= Main evaluation =======================
 def dynamic_import(import_path: str, class_name: str):
@@ -496,30 +546,6 @@ def detect_mode(cfg: Dict[str, Any], sample_tensor: torch.Tensor = None) -> str:
     if sample_tensor is not None and sample_tensor.ndim == 4:
         return "pretrain_2d" if sample_tensor.shape[1] == 1 else "videos"
     return "videos"
-
-IMSHOW_PERCENTILE = 95.0
-@torch.no_grad()
-def save_cmr_image_matplotlib(img_1hw: torch.Tensor, path: str, percentile: float = IMSHOW_PERCENTILE):
-    """
-    Save a single-channel magnitude image [1,H,W] using matplotlib, with
-    vmin=min(image), vmax=percentile(image).
-    Falls back to the old imageio path if matplotlib is unavailable.
-    """
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        # Fallback: previous behavior
-        from imageio.v2 import imwrite
-        imwrite(path, frame_to_uint8(img_1hw))
-        return
-
-    f = img_1hw.detach().float().cpu()
-    f = torch.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0)
-    vmin = float(f.min().item())
-    vmax = float(torch.quantile(f.flatten(), percentile / 100.0).item())
-    fig, ax = plt.subplots()
-    ax.imshow(f.squeeze(0).numpy(), cmap="gray", vmin=vmin, vmax=vmax); ax.axis("off")
-    fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=160); plt.close(fig)
 
 @torch.no_grad()
 def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
@@ -551,22 +577,11 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
     M = dynamic_import(cfg["model"]["import_path"], cfg["model"]["class_name"])
     model = M(**cfg["model"]["args"]).to(device).eval()
 
-    # Load checkpoint (prefer EMA weights if present)
     if ckpt_path and os.path.isfile(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        base_state = ckpt.get("model", ckpt)
-        ema_state  = ckpt.get("ema", None)
-
-        if isinstance(ema_state, dict) and len(ema_state) > 0:
-            merged = dict(base_state)  # shallow copy
-            for k, v in ema_state.items():
-                if isinstance(v, torch.Tensor):
-                    merged[k] = v
-            missing, unexpected = model.load_state_dict(merged, strict=False)
-            print(f"[eval] loaded EMA weights: {ckpt_path} (missing={len(missing)}, unexpected={len(unexpected)})")
-        else:
-            missing, unexpected = model.load_state_dict(base_state, strict=False)
-            print(f"[eval] loaded (non-EMA): {ckpt_path} (missing={len(missing)}, unexpected={len(unexpected)})")
+        state = torch.load(ckpt_path, map_location="cpu")
+        state = state.get("model", state)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[eval] loaded: {ckpt_path} (missing={len(missing)}, unexpected={len(unexpected)})")
     else:
         print(f"[eval] WARNING: checkpoint not found: {ckpt_path}")
 
@@ -595,7 +610,7 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
         "robust_snr_phase",
         "robust_snr_roll",
     ]}
-    MU_chunks = []  # collect raw mu across patches/samples
+    MU_chunks = []  # collect raw mu (not standardized) across patches/samples
 
     # ---- Iterate ----
     n_done = 0
@@ -611,33 +626,31 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
             patch_t = (patch_t_default if is_video else 1)
             patch_size = (patch_t, patch_h, patch_w)
 
-            # --- NEW Patchify (fixed 50% overlap + Hann OA) ---
-            S0 = max(1, patch_t // 2); S1 = max(1, patch_h // 2); S2 = max(1, patch_w // 2)
-            strides_fixed = (S0, S1, S2)
-            W3D = _hann3d(patch_t if T>1 else 1, patch_h, patch_w, x.device)
-
-            r_p = _patchify_fixed_stride(x[0], (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed)
-            i_p = _patchify_fixed_stride(x[1], (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed)
+            # --- Patchify ---
+            r_p, strides = patchify(x[0], patch_size)
+            i_p, _       = patchify(x[1], patch_size)
             Np = int(r_p.shape[0])
             patches = [ torch.stack((r_p[n], i_p[n]), dim=0).to(device) for n in range(Np) ]
 
-            # --- Deterministic forward (μ only) in micro-batches ---
-            xhat_list, mu_list, logv_list = [], [], []
+            # --- Forward (micro-batches) ---
+            xhat_list, mu_list, logv_list, z_list = [], [], [], []
             for i in range(0, Np, patch_bs):
-                chunk = patches[i:i+patch_bs]               # list of [2,t,h,w]
-                enc_pairs = model(chunk, op="encode")       # list of (mu, logv)
-                mus  = [mu for (mu, _lv) in enc_pairs]
-                xhats = model.decode(mus)                   # list of [B=1,2,t,h,w]
-                for xh, (mu, lv) in zip(xhats, enc_pairs):
-                    xhat_list.append(xh.squeeze(0))         # [2,t,h,w]
-                    mu_list.append(mu.squeeze(0))           # [Cz,n,H',W']
+                chunk = patches[i:i+patch_bs]
+                out = model(chunk)  # -> (xhats, mus, logvs, zs)
+                if not (isinstance(out, (list, tuple)) and len(out) >= 4):
+                    raise RuntimeError("Model forward must return (xhats, mus, logvs, zs)")
+                xhats, mus, logvs, zs = out
+                for xh, mu, lv, z in zip(xhats, mus, logvs, zs):
+                    xhat_list.append(xh.squeeze(0))  # [2,t,h,w]
+                    mu_list.append(mu.squeeze(0))    # [Cz,n,H',W']
                     logv_list.append(lv.squeeze(0))
+                    z_list.append(z.squeeze(0))
 
-            # --- Depatchify to full recon (Hann OA) ---
+            # --- Depatchify to full recon ---
             r_rec = torch.stack([xh[0] for xh in xhat_list], dim=0)
             i_rec = torch.stack([xh[1] for xh in xhat_list], dim=0)
-            xhat_r = _depatchify_fixed_stride(r_rec, (T, H, W), (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed, W3D)
-            xhat_i = _depatchify_fixed_stride(i_rec, (T, H, W), (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed, W3D)
+            xhat_r = depatchify(r_rec, (T, H, W), patch_size, strides)
+            xhat_i = depatchify(i_rec, (T, H, W), patch_size, strides)
             xhat   = torch.stack((xhat_r, xhat_i), dim=0)  # [2,T,H,W]
 
             # --- Full-image metrics ---
@@ -646,7 +659,7 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
             l1k    = charb_l1(fft2c(x), fft2c(xhat))
             lpips_m = lpips_on_full(x, xhat)
 
-            # --- Smoothness (μ aggregated across patches) ---
+            # --- Smoothness (μ over ALL patches concatenated along time) ---
             mu_cat = torch.cat(mu_list, dim=1) if len(mu_list) > 0 else None  # [Cz, sum_n, H', W']
             tv = tv3d(mu_cat) if mu_cat is not None else float("nan")
             jerk = temporal_jerk(mu_cat) if mu_cat is not None else float("nan")
@@ -662,18 +675,18 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                 loc = {"locality_temporal_spread_frames_mean": float("nan"),
                        "locality_spatial_rms_px_mean": float("nan")}
 
-            # --- Robustness through FULL (new) patch pipeline (deterministic) ---
+            # --- Robustness through FULL patch pipeline ---
             rob = robustness_metrics_full_pipeline(
                 model, x, patch_size=patch_size, patch_bs=patch_bs,
                 noise_sigma=noise_sigma, phase_deg=phase_deg
             )
 
-            # --- Gaussianity accumulation (store RAW mu, standardize later) ---
+            # --- Gaussianity accumulation (store RAW mu, standardize later globally) ---
             subsample_positions = int(cfg.get("gauss_subsample_positions", 8192))
             for mu in mu_list:
                 C, nH, Hh, Ww = mu.shape
                 M = nH * Hh * Ww
-                mu_flat = mu.reshape(C, M).t().contiguous()  # [M, C]
+                mu_flat = mu.reshape(C, M).t().contiguous()  # [M, C] raw μ (no standardization)
                 if mu_flat.shape[0] > subsample_positions:
                     idx = torch.randperm(mu_flat.shape[0], device=mu_flat.device)[:subsample_positions]
                     mu_flat = mu_flat[idx]
@@ -688,28 +701,28 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
 
                 if is_video:
                     mid = T // 2
-                    # Save mid-frame stills with percentile-based vmax using matplotlib
-                    save_cmr_image_matplotlib(
-                        xm[:, mid], os.path.join(out_dir, f"sample{n_done:03d}_gt_mid.png")
-                    )
-                    save_cmr_image_matplotlib(
-                        xhm[:, mid], os.path.join(out_dir, f"sample{n_done:03d}_recon_mid.png")
-                    )
+                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_gt_mid.png"),
+                                frame_to_uint8(xm[:, mid]))
+                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_recon_mid.png"),
+                                frame_to_uint8(xhm[:, mid]))
                     save_video_from_1t(xm,  os.path.join(out_dir, f"sample{n_done:03d}_gt_mag.mp4"),  fps=7)
                     save_video_from_1t(xhm, os.path.join(out_dir, f"sample{n_done:03d}_recon_mag.mp4"), fps=7)
                 else:
-                    save_cmr_image_matplotlib(xm[:, 0],  os.path.join(out_dir, f"sample{n_done:03d}_gt.png"))
-                    save_cmr_image_matplotlib(xhm[:, 0], os.path.join(out_dir, f"sample{n_done:03d}_recon.png"))
+                    err = (xm[:, 0] - xhm[:, 0]).abs()
+                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_gt.png"),    frame_to_uint8(xm[:, 0]))
+                    iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_recon.png"), frame_to_uint8(xhm[:, 0]))
 
+                # --- error map visualizations ---
                 try:
                     save_error_visuals(x, xhat, out_dir, n_done, is_video=is_video)
                 except Exception as e:
                     print(f"[viz] error-map save failed on sample {n_done}: {e}")
 
-                # latent μ grid
+                # latent μ grid (image or latent-video over latent frames)
                 if len(mu_list) > 0:
                     mu0 = mu_list[0]  # [Cz,n,H',W']
                     if is_video and mu0.shape[1] > 1:
+                        # latent video grid across n (latent frames) for a representative patch
                         frames = []
                         for t in range(mu0.shape[1]):
                             grid = make_grid_from_channels(mu0[:, t]).detach().cpu().numpy()
@@ -725,19 +738,19 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                         iio.imwrite(os.path.join(out_dir, f"sample{n_done:03d}_latent_mu_grid_t{t_m}.png"),
                                     (grid * 255.0).astype(np.uint8))
 
-                # PSF panel (optional quick viz)
+                # PSF panel (optional)
                 if hasattr(model, "decode") and len(mu_list) > 0:
                     try:
                         mu0 = mu_list[0]; z_one = mu0.unsqueeze(0)
                         def decode_patch(Z):
                             out = model.decode([Z]); 
                             return out[0] if isinstance(out, list) else out
-                        base = decode_patch(z_one)
+                        base = decode_patch(z_one); 
                         if base.dim() == 5: base = base.squeeze(0)
                         base_mag = complex_mag(base).squeeze(0)  # [t,h,w]
                         z2 = z_one.clone()
                         z2[0, 0, min(0, z2.shape[2]-1), z2.shape[3]//2, z2.shape[4]//2] += locality_eps
-                        out = decode_patch(z2)
+                        out = decode_patch(z2); 
                         if out.dim() == 5: out = out.squeeze(0)
                         diff = (complex_mag(out).squeeze(0) - base_mag).abs()
                         t_star = int(torch.argmax(diff.sum(dim=(1,2))).item())
@@ -761,7 +774,6 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                 "smooth_temporal_jerk": jerk,
                 **loc, **rob,
             }
-            print(row)
 
             per_sample_rows.append(row)
             for k in acc_lists.keys():
@@ -774,22 +786,24 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
         if n_done >= max_items:
             break
 
-    # ---- Gaussianity across channels (aggregate; global standardization) ----
+    # ---- Gaussianity across channels (aggregate; two-pass GLOBAL standardization) ----
     if len(MU_chunks) > 0:
         MU_all = torch.cat(MU_chunks, dim=0)  # [Npos, C], raw μ
         mean = MU_all.mean(dim=0, keepdim=True)
         std  = MU_all.std(dim=0, keepdim=True).clamp_min(1e-6)
-        Z_all = (MU_all - mean) / std
+        Z_all = (MU_all - mean) / std                        # global per-channel Z
         gauss = channel_gaussianity_stats(Z_all)
         gauss["cov_offdiag_abs_mean"] = offdiag_cov_abs_mean(Z_all)
+
+        # --- Save channel histograms (uses globally standardized Z_all) ---
         try:
             save_channel_histograms(Z_all.cpu(), out_dir, max_ch=int(hist_max_ch), bins=int(hist_bins))
         except Exception as e:
             print(f"[viz] histogram save failed: {e}")
     else:
         gauss = {"skew_abs_mean": float("nan"), "kurtosis_mean": float("nan"),
-                 "jb_reject_rate": float("nan"), "std_mean": float("nan"),
-                 "mean_abs_mean": float("nan"), "cov_offdiag_abs_mean": float("nan")}
+                "jb_reject_rate": float("nan"), "std_mean": float("nan"),
+                "mean_abs_mean": float("nan"), "cov_offdiag_abs_mean": float("nan")}
 
     # ---- Summaries ----
     def _nm(a): return float(np.nanmean(a)) if len(a) else float("nan")
@@ -824,8 +838,8 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/vae.yaml", help="YAML config path")
-    ap.add_argument("--ckpt",   type=str, default="/storage/matt_models/cardiac_vae/pretrain_2d/step_0060000/state.pt", help="Path to checkpoint .pt (state.pt)")
-    ap.add_argument("--out",    type=str, default="eval_out_ema", help="Output directory")
+    ap.add_argument("--ckpt",   type=str, default="/storage/matt_models/cardiac_vae/step_0052000/state.pt", help="Path to checkpoint .pt (state.pt)")
+    ap.add_argument("--out",    type=str, default="eval_out", help="Output directory")
     ap.add_argument("--max-items", type=int, default=500, help="Max number of samples to evaluate")
     ap.add_argument("--locality-probes", type=int, default=4)
     ap.add_argument("--locality-eps", type=float, default=0.1)

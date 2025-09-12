@@ -12,6 +12,8 @@ if LAUNCH_ROOT not in sys.path:
 
 import torch
 torch.autograd.set_detect_anomaly(True)
+from collections import OrderedDict
+from utils.ema import Ema
 
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -32,6 +34,18 @@ import time
 # Optional LPIPS (pixel space)
 try:
     import lpips
+    # --- Patch lpips.normalize_tensor to avoid sqrt(0) and NaN/Inf propagation ---
+    def _safe_normalize_tensor(in_feat: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+        # Guard against NaNs/Infs from earlier layers
+        in_feat = torch.nan_to_num(in_feat, nan=0.0, posinf=0.0, neginf=0.0)
+        # Add eps *inside* the sqrt AND in the denominator to keep forward/backward finite
+        norm2 = torch.sum(in_feat * in_feat, dim=1, keepdim=True)
+        norm = torch.sqrt(norm2 + eps)
+        return in_feat / (norm + eps)
+
+    # Monkey-patch the library
+    lpips.normalize_tensor = _safe_normalize_tensor
+
     _HAS_LPIPS = True
 except Exception:
     _HAS_LPIPS = False
@@ -115,7 +129,7 @@ def compute_stride_and_n_patches(D, P, extra_patch_num=0):
         S = max(S, 1)
     return S, n_patches
 
-def compute_strides_and_N(data_shape, patch_size=(80, 80, 11), extra_patch_num=(0,0,0)):
+def compute_strides_and_N(data_shape, patch_size=(80, 80, 7), extra_patch_num=(0,0,0)):
     strides = []
     n_patches_list = []
     for D, P, extra in zip(data_shape, patch_size, extra_patch_num):
@@ -264,7 +278,7 @@ class CardiacVAETrainer:
         self.cfg = cfg
         self.model = model
 
-        self.model = torch.compile(self.model) # Can do w/ fixed shapes..
+        # self.model = torch.compile(self.model, fullgraph=False) # Can do w/ fixed shapes..
 
         # Stage
         mode = cfg["stages"]["mode"]
@@ -302,25 +316,30 @@ class CardiacVAETrainer:
         stage_loss_cfg = cfg["loss"][self.mode]
         if self.mode == "pretrain_2d":
             base_weights = {
-                "img": float(stage_loss_cfg.get("w_img", 3.0)),
+                "mse": float(stage_loss_cfg.get("w_mse", 1.0)),
+                "l1": float(stage_loss_cfg.get("w_l1", 3.0)),
                 "lpips": float(stage_loss_cfg.get("w_lpips", 3.0)),
                 "kl": float(stage_loss_cfg.get("w_kl", 3e-6)),
             }
         else:
             base_weights = {
-                "img": float(stage_loss_cfg.get("w_img", 1.0)),
-                "lpips": float(stage_loss_cfg.get("w_lpips", 0.5)),
+                "mse": float(stage_loss_cfg.get("w_mse", 1.0)),
+                "l1": float(stage_loss_cfg.get("w_l1", 3.0)),
+                "lpips": float(stage_loss_cfg.get("w_lpips", 3.0)),
                 "kl": float(stage_loss_cfg.get("w_kl", 1e-3)),
                 "tvz": float(stage_loss_cfg.get("w_tvz", 1e-3)),
             }
+
         self.loss_sched = LossSchedulerSteps(base_weights, stage_loss_cfg.get("schedules", {}), self.total_steps)
         self.current_w = self.loss_sched.weights_for_step(1)
 
+        resume_state = None
         if self.cfg["model"].get("load_state_dict_from", None) is not None and self.cfg['model']['resume']:
             resume_state = torch.load(self.cfg["model"]["load_state_dict_from"], map_location="cpu")
             self.optimizer.load_state_dict(resume_state["optimizer"])
             if self.scheduler is not None and "scheduler" in resume_state:
                 self.scheduler.load_state_dict(resume_state["scheduler"])
+
             self.global_step = int(resume_state.get("global_step", 0))
             self.current_w = self.loss_sched.weights_for_step(self.global_step)
             self.accelerator.print(
@@ -336,6 +355,14 @@ class CardiacVAETrainer:
         else:
             (self.model, self.optimizer, self.train_dl, self.val_dl) = \
                 self.accelerator.prepare(self.model, self.optimizer, self.train_dl, self.val_dl)
+
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        self.ema = Ema(unwrapped, decay=float(self.cfg["optim"].get("ema_decay", 0.999)))
+
+        if resume_state is not None and "ema" in resume_state:
+            ema_state = resume_state["ema"]
+            ema_state = {k: v.to(self.accelerator.device) for k, v in ema_state.items()}
+            self.ema.load_shadow(ema_state)
 
         self.grad_clip = float(opt_cfg.get("grad_clip", 0.0))
 
@@ -362,7 +389,7 @@ class CardiacVAETrainer:
             self.use_lpips = False
         self.lpips_net = None
         if self.use_lpips:
-            self.lpips_net = lpips.LPIPS(net="alex")
+            self.lpips_net = lpips.LPIPS(net="vgg")
             self.lpips_net = self.lpips_net.to(self.accelerator.device)
             self.lpips_net.eval()
             for p in self.lpips_net.parameters():
@@ -374,7 +401,7 @@ class CardiacVAETrainer:
         vcfg = self.cfg.get("validation", {})
         self.val_patch_h = int(vcfg.get("patch_h", 80))
         self.val_patch_w = int(vcfg.get("patch_w", 80))
-        self.val_patch_t = int(vcfg.get("patch_t", 11))      # videos
+        self.val_patch_t = int(vcfg.get("patch_t", 7))      # videos
         self.val_patch_bs = int(vcfg.get("patch_batch", 32)) # how many patches per forward
 
     # ---------- helpers ----------
@@ -389,17 +416,24 @@ class CardiacVAETrainer:
     @staticmethod
     def _complex_mag(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         assert x.dim() == 4 and x.shape[0] == 2, f"complex_mag expects [2,T,H,W], got {tuple(x.shape)}"
-        return (x.pow(2).sum(dim=0, keepdim=True) + eps).sqrt()
+        # x: [2,T,H,W]
+        # robust to NaN/Inf and prevents negative under sqrt
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        xr, xi = x[0], x[1]
+        s = xr ** 2 + xi ** 2
+        s = torch.nan_to_num(s, nan=0.0, posinf=1e12, neginf=0.0)  # keep it finite and non-negative
+        return torch.sqrt(s.clamp_min(0.0)).unsqueeze(0)
 
     @staticmethod
-    def _charb_l1_mag(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-        diff = CardiacVAETrainer._complex_mag(x) - CardiacVAETrainer._complex_mag(y)
-        return (diff.pow(2) + eps * eps).sqrt().mean()
+    def _mse_complex(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # x,y: [2,T,H,W]
+        return torch.nn.functional.mse_loss(x, y)
 
-    @staticmethod
-    def _charb_l1(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-        diff = x - y
-        return (diff.pow(2) + eps * eps).sqrt().mean()
+    def _l1_mag(self, x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        # |x| and |y| with small eps for stability, then L1
+        xm = self._complex_mag(x)
+        ym = self._complex_mag(y)
+        return torch.nn.functional.l1_loss(xm, ym)
 
     @staticmethod
     def _tv3d(z: torch.Tensor) -> torch.Tensor:
@@ -416,7 +450,7 @@ class CardiacVAETrainer:
 
     @staticmethod
     def _kl_gaussian_channels(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-        logvar = log_var.clamp(-30.0, 20.0)
+        logvar = log_var.clamp(-30, 20.0)
         return 0.5 * (mu.pow(2) + log_var.exp() - log_var - 1.0).mean()
 
     @staticmethod
@@ -655,60 +689,58 @@ class CardiacVAETrainer:
         if self.mode == "pretrain_2d":
             xhats, mus, logvs, zs = self.model(xs)
 
-            img_vals, lpips_vals, kl_vals = [], [], []
+            mse_c_vals, l1m_vals, lpips_vals, kl_vals = [], [], [], []
             for x, xhat, mu, logv, z in zip(xs, xhats, mus, logvs, zs):
                 xhatv = xhat.squeeze(0)
+                xhatv = torch.nan_to_num(xhatv, nan=0.0, posinf=0.0, neginf=0.0)
+                x     = torch.nan_to_num(x,     nan=0.0, posinf=0.0, neginf=0.0)
                 mu, logv = mu.squeeze(0), logv.squeeze(0)
-                z = z.squeeze(0)
 
-                if self.cfg["loss"][self.mode]["complex_l1"]:
-                    img_vals.append(self._charb_l1(xhatv, x))
-                else:
-                    img_vals.append(self._charb_l1_mag(xhatv, x))
-
-                if self.use_lpips:
+                mse_c_vals.append(self._mse_complex(xhatv, x))           # MSE on complex
+                l1m_vals.append(self._l1_mag(xhatv, x))                  # L1 on magnitude
+                if self.use_lpips:                                        # LPIPS on magnitude
                     lpips_vals.append(self._lpips_loss_item(x, xhatv, mode="pretrain_2d"))
                 kl_vals.append(self._kl_gaussian_channels(mu, logv))
 
-            img = torch.stack(img_vals).mean()
-            lpips_loss = torch.stack(lpips_vals).mean() if lpips_vals else torch.zeros((), device=device)
-            kl  = torch.stack(kl_vals).mean()
+            mse_c   = torch.stack(mse_c_vals).mean()
+            l1_mag  = torch.stack(l1m_vals).mean()
+            lpips_l = torch.stack(lpips_vals).mean() if lpips_vals else torch.zeros((), device=device)
+            kl      = torch.stack(kl_vals).mean()
 
             w = self.current_w
-            total = (w["img"] * img + w["lpips"] * lpips_loss + w["kl"] * kl)
+            total = (w["mse"] * mse_c + w["l1"] * l1_mag + w["lpips"] * lpips_l + w["kl"] * kl)
 
-            return {"total": total, "img": img, "lpips": lpips_loss, "kl": kl,
+            return {"total": total, "mse": mse_c, "l1": l1_mag, "lpips": lpips_l, "kl": kl,
                     "xs": xs, "xhats": [xhat.squeeze(0).detach() for xhat in xhats]}
 
         else:
             xhats, mus, logvs, zs = self.model(xs)
 
-            img_vals, tvz_vals, kl_vals, lpips_vals = [], [], [], []
+            mse_c_vals, l1m_vals, tvz_vals, kl_vals, lpips_vals = [], [], [], [], []
             for x, xhat, mu, logv, z in zip(xs, xhats, mus, logvs, zs):
                 xhatv = xhat.squeeze(0)
+                xhatv = torch.nan_to_num(xhatv, nan=0.0, posinf=0.0, neginf=0.0)
+                x     = torch.nan_to_num(x,     nan=0.0, posinf=0.0, neginf=0.0)
                 mu, logv = mu.squeeze(0), logv.squeeze(0)
                 z = z.squeeze(0)
 
-                if self.cfg["loss"][self.mode]["complex_l1"]:
-                    img_vals.append(self._charb_l1(xhatv, x))
-                else:
-                    img_vals.append(self._charb_l1_mag(xhatv, x))
-
+                mse_c_vals.append(self._mse_complex(xhatv, x))
+                l1m_vals.append(self._l1_mag(xhatv, x))
                 tvz_vals.append(self._tv3d(z))
                 kl_vals.append(self._kl_gaussian_channels(mu, logv))
                 if self.use_lpips:
                     lpips_vals.append(self._lpips_loss_item(x, xhatv, mode="videos"))
 
-            img = torch.stack(img_vals).mean()
-            tvz = torch.stack(tvz_vals).mean()
-            kl  = torch.stack(kl_vals).mean()
-            lpips_loss = torch.stack(lpips_vals).mean() if lpips_vals else torch.zeros((), device=device)
+            mse_c   = torch.stack(mse_c_vals).mean()
+            l1_mag  = torch.stack(l1m_vals).mean()
+            tvz     = torch.stack(tvz_vals).mean()
+            kl      = torch.stack(kl_vals).mean()
+            lpips_l = torch.stack(lpips_vals).mean() if lpips_vals else torch.zeros((), device=device)
 
             w = self.current_w
-            total = (w["img"] * img + w["lpips"] * lpips_loss +
-                    w["tvz"] * tvz + w["kl"] * kl)
+            total = (w["mse"] * mse_c + w["l1"] * l1_mag + w["lpips"] * lpips_l + w["tvz"] * tvz + w["kl"] * kl)
 
-            return {"total": total, "img": img, "lpips": lpips_loss,
+            return {"total": total, "mse": mse_c, "l1": l1_mag, "lpips": lpips_l,
                     "tvz": tvz, "kl": kl,
                     "xs": xs, "xhats": [xhat.squeeze(0) for xhat in xhats]}
 
@@ -771,6 +803,7 @@ class CardiacVAETrainer:
 
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    self.ema.update(self.accelerator.unwrap_model(self.model))
 
                     if self.scheduler is not None:
                         self.scheduler.step()
@@ -797,7 +830,7 @@ class CardiacVAETrainer:
                         scalars.update({f"w/{k}": float(v) for k, v in self.current_w.items()})
                         wandb.log(scalars, step=self.global_step)
 
-                    if (self.global_step % log_cfg["val_every_steps"] == 0) and self.global_step > self.start_step:
+                    if (self.global_step % log_cfg["val_every_steps"] == 0):# and self.global_step > self.start_step:
                         if self.accelerator.is_main_process:
                             pbar.write(f"[val] step {self.global_step}")
                         self.validate()
@@ -894,18 +927,20 @@ class CardiacVAETrainer:
     def validate(self):
         self.model.eval()
 
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        self.ema.apply_to(unwrapped)
+
         # Keep key names unchanged
-        keys = ["total","img","k","kl","lpips"] if self.mode=="pretrain_2d" else ["total","img","k","lpips","tvz","kl"]
+        keys = ["total","mse","l1","k","kl","lpips","patch_snr_mean","patch_snr_min"] if self.mode=="pretrain_2d" else ["total","mse","l1","k","lpips","tvz","kl","patch_snr_mean","patch_snr_min"]
 
         device = self.accelerator.device
         meters_sum = {k: torch.zeros((), device=device, dtype=torch.float32) for k in keys}
         items_cnt  = torch.zeros((), device=device, dtype=torch.float32)
 
-        sse_mag_rank = torch.zeros((), device=device, dtype=torch.float32)
-        cnt_mag_rank = torch.zeros((), device=device, dtype=torch.float32)
         # For complex SNR aggregation across the whole validation set
         energy_sig_rank = torch.zeros((), device=device, dtype=torch.float32)
         energy_err_rank = torch.zeros((), device=device, dtype=torch.float32)
+        n_elem_rank = torch.zeros((), device=device, dtype=torch.float32)
 
         logged_media    = False
         logged_latents  = False
@@ -920,7 +955,14 @@ class CardiacVAETrainer:
             bs = max(1, self.val_patch_bs)
             for i in range(0, len(patches_list), bs):
                 chunk = patches_list[i:i+bs]                   # list of [2,t,h,w]
-                xhats, mus, logvs, zs = self.model(chunk)     # lists aligned to chunk
+
+                pairs = self.model(chunk, op="encode")           # -> list[(μ, logv)]
+                mus, logvs = zip(*pairs) if isinstance(pairs, list) else ([pairs[0]], [pairs[1]])
+
+                xhats = self.model(list(mus), op="decode")
+
+                zs = list(mus)
+                
                 for xh, mu, lv, z in zip(xhats, mus, logvs, zs):
                     xhat_list.append(xh.squeeze(0))           # [2,t,h,w]
                     mu_list.append(mu.squeeze(0))             # [Cz,n,H',W']
@@ -939,38 +981,203 @@ class CardiacVAETrainer:
                 x = x.to(device=device, dtype=torch.float32)
                 _, T, H, W = x.shape
 
-                # -------- patchify along (T,H,W) using colleague logic --------
-                patch_t = self.val_patch_t if T > 1 else 1  # pretrain_2d uses 1
+                # # -------- patchify along (T,H,W) using colleague logic --------
+                # patch_t = self.val_patch_t if T > 1 else 1  # pretrain_2d uses 1
+                # patch_h = self.val_patch_h
+                # patch_w = self.val_patch_w
+                # patch_size = (patch_t, patch_h, patch_w)
+
+                # # Real/imag patchify separately, stack to [N,2,t,h,w]
+                # r_patches, strides = patchify(x[0], patch_size)  # [N,t,h,w]
+                # i_patches, _       = patchify(x[1], patch_size)  # [N,t,h,w]
+                # Np = int(r_patches.shape[0])
+
+                # patches_list = [ torch.stack((r_patches[n], i_patches[n]), dim=0) for n in range(Np) ]  # list of [2,t,h,w]
+                # -------- fixed 50% overlap + Hann window (validation only) --------
+                patch_t = self.val_patch_t if T > 1 else 1
                 patch_h = self.val_patch_h
                 patch_w = self.val_patch_w
                 patch_size = (patch_t, patch_h, patch_w)
 
-                # Real/imag patchify separately, stack to [N,2,t,h,w]
-                r_patches, strides = patchify(x[0], patch_size)  # [N,t,h,w]
-                i_patches, _       = patchify(x[1], patch_size)  # [N,t,h,w]
-                Np = int(r_patches.shape[0])
+                # fixed strides = half patch (safe for T==1)
+                S0 = max(1, patch_t // 2)
+                S1 = max(1, patch_h // 2)
+                S2 = max(1, patch_w // 2)
+                strides_fixed = (S0, S1, S2)
 
-                patches_list = [ torch.stack((r_patches[n], i_patches[n]), dim=0) for n in range(Np) ]  # list of [2,t,h,w]
+                def _hann3d(t, h, w, device):
+                    wt = torch.hann_window(t, periodic=False, device=device).view(t, 1, 1) if t > 1 else torch.ones((t, 1, 1), device=device)
+                    wh = torch.hann_window(h, periodic=False, device=device).view(1, h, 1)
+                    ww = torch.hann_window(w, periodic=False, device=device).view(1, 1, w)
+                    return wt * wh * ww  # [t,h,w]
+
+                def _patchify_fixed_stride(vol_thw: torch.Tensor, patch_size, strides):
+                    # vol_thw: [T,H,W]
+                    P0, P1, P2 = patch_size
+                    S0, S1, S2 = strides
+                    T_, H_, W_ = vol_thw.shape
+                    n0 = max(1, math.ceil((T_ - P0) / S0) + 1)
+                    n1 = max(1, math.ceil((H_ - P1) / S1) + 1)
+                    n2 = max(1, math.ceil((W_ - P2) / S2) + 1)
+                    N = n0 * n1 * n2
+
+                    patches = torch.zeros((N, P0, P1, P2), dtype=vol_thw.dtype, device=vol_thw.device)
+                    extents = []  # list of (s0,s1,s2) for valid region (no padding) per patch
+                    idx = 0
+                    for i in range(n0):
+                        t0 = i * S0; t1 = min(t0 + P0, T_); s0 = t1 - t0
+                        for j in range(n1):
+                            y0 = j * S1; y1 = min(y0 + P1, H_); s1 = y1 - y0
+                            for k in range(n2):
+                                x0 = k * S2; x1 = min(x0 + P2, W_); s2 = x1 - x0
+                                patch = torch.zeros((P0, P1, P2), dtype=vol_thw.dtype, device=vol_thw.device)
+                                patch[:s0, :s1, :s2] = vol_thw[t0:t1, y0:y1, x0:x1]
+                                patches[idx] = patch
+                                extents.append((s0, s1, s2))
+                                idx += 1
+                    return patches, extents
+
+                def _depatchify_fixed_stride(
+                    patches: torch.Tensor,          # [N, P0,P1,P2]
+                    data_shape,                     # (T_, H_, W_)
+                    patch_size,                     # (P0, P1, P2)
+                    strides,                        # (S0, S1, S2)
+                    window_3d: torch.Tensor,        # unused; kept for drop-in compatibility
+                ):
+                    """
+                    Overlap-add depatchify with index-aware ramps so boundary slices keep weight 1
+                    (no Hann-at-zero issue). 'window_3d' is ignored.
+                    """
+                    P0, P1, P2 = patch_size
+                    S0, S1, S2 = strides
+                    T_, H_, W_ = data_shape
+
+                    n0 = max(1, math.ceil((T_ - P0) / S0) + 1)
+                    n1 = max(1, math.ceil((H_ - P1) / S1) + 1)
+                    n2 = max(1, math.ceil((W_ - P2) / S2) + 1)
+                    expected = n0 * n1 * n2
+                    if int(patches.shape[0]) != expected:
+                        raise RuntimeError(
+                            f"depatchify: N={patches.shape[0]} but expected {expected} for "
+                            f"shape={data_shape}, P={patch_size}, S={strides}"
+                        )
+
+                    device = patches.device
+                    dtype  = patches.dtype
+
+                    out_num = torch.zeros((T_, H_, W_), dtype=dtype, device=device)
+                    out_den = torch.zeros((T_, H_, W_), dtype=torch.float32, device=device)
+
+                    # overlap extents per axis
+                    O0 = max(0, P0 - S0)
+                    O1 = max(0, P1 - S1)
+                    O2 = max(0, P2 - S2)
+
+                    def axis_weights(L_eff: int, idx: int, n: int, O: int) -> torch.Tensor:
+                        has_prev = (idx > 0)
+                        has_next = (idx < n - 1)
+
+                        L_left  = min(O if has_prev else 0, L_eff)
+                        L_right = min(O if has_next else 0, L_eff)
+
+                        # If ramps would overlap more than the valid extent, re-split sensibly
+                        if L_left + L_right > L_eff:
+                            if L_left > 0 and L_right > 0:
+                                total = L_left + L_right
+                                L_left_new  = max(1, int(round(L_eff * (L_left / total))))
+                                L_right_new = L_eff - L_left_new
+                                L_left, L_right = L_left_new, L_right_new
+                            else:
+                                L_left  = min(L_left,  L_eff)
+                                L_right = L_eff - L_left
+
+                        w = torch.ones(L_eff, dtype=torch.float32, device=device)
+                        if L_left > 0:
+                            w[:L_left] = 0.5 if L_left == 1 else torch.linspace(0.0, 1.0, steps=L_left, device=device)
+                        if L_right > 0:
+                            w[-L_right:] = 0.5 if L_right == 1 else torch.linspace(1.0, 0.0, steps=L_right, device=device)
+                        return w
+
+                    idx = 0
+                    for i in range(n0):
+                        t0 = i * S0; t1 = min(t0 + P0, T_); s0 = t1 - t0
+                        w0 = axis_weights(s0, i, n0, O0)
+                        for j in range(n1):
+                            y0 = j * S1; y1 = min(y0 + P1, H_); s1 = y1 - y0
+                            w1 = axis_weights(s1, j, n1, O1)
+                            for k in range(n2):
+                                x0 = k * S2; x1 = min(x0 + P2, W_); s2 = x1 - x0
+                                w2 = axis_weights(s2, k, n2, O2)
+
+                                w = (w0[:, None, None] * w1[None, :, None] * w2[None, None, :])
+                                p = patches[idx][:s0, :s1, :s2]
+
+                                out_num[t0:t1, y0:y1, x0:x1] += (p * w).to(out_num.dtype)
+                                out_den[t0:t1, y0:y1, x0:x1] += w
+                                idx += 1
+
+                    out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
+                    return out_num / out_den.to(out_num.dtype)
+
+                # window used in OA
+                W3D = _hann3d(patch_t, patch_h, patch_w, x.device)
+
+                # Build patches with fixed strides (real/imag)
+                r_patches, extents = _patchify_fixed_stride(x[0], patch_size, strides_fixed)  # [N,t,h,w], list[(s0,s1,s2)]
+                i_patches, _       = _patchify_fixed_stride(x[1], patch_size, strides_fixed)  # extents identical; ignore
+                Np = int(r_patches.shape[0])
+                patches_list = [torch.stack((r_patches[n], i_patches[n]), dim=0) for n in range(Np)]  # [2,t,h,w]
 
                 # -------- run VAE on each patch (batched) --------
                 xhat_list, mu_list, logv_list, z_list = run_patches_through_vae(patches_list)
 
-                # -------- reconstruct full-resolution video via depatchify --------
-                # per-channel overlap-add
-                r_rec_patches = torch.stack([xh[0] for xh in xhat_list], dim=0)  # [N,t,h,w]
-                i_rec_patches = torch.stack([xh[1] for xh in xhat_list], dim=0)  # [N,t,h,w]
+                # ---- per-patch SNR on valid (unpadded) region ----
+                snr_dbs = []
+                eps = 1e-12
+                for n, (s0, s1, s2) in enumerate(extents):
+                    gt = torch.stack((
+                        r_patches[n][:s0, :s1, :s2],
+                        i_patches[n][:s0, :s1, :s2],
+                    ), dim=0)  # [2,s0,s1,s2]
 
-                xhat_r = depatchify(r_rec_patches, (T, H, W), patch_size, strides)  # [T,H,W]
-                xhat_i = depatchify(i_rec_patches, (T, H, W), patch_size, strides)  # [T,H,W]
-                xhat   = torch.stack((xhat_r, xhat_i), dim=0)                        # [2,T,H,W]
+                    pr = xhat_list[n][:, :s0, :s1, :s2]  # [2,s0,s1,s2]
+
+                    sig = (gt * gt).sum()
+                    err = ((pr - gt) * (pr - gt)).sum()
+                    snr = 10.0 * torch.log10(sig.clamp_min(eps) / err.clamp_min(eps))
+                    if torch.isfinite(snr):
+                        snr_dbs.append(snr)
+
+                if len(snr_dbs) == 0:
+                    snr_p_mean = torch.zeros((), device=device, dtype=torch.float32)
+                    snr_p_min  = torch.zeros((), device=device, dtype=torch.float32)
+                else:
+                    snr_stack  = torch.stack(snr_dbs)  # [N_valid]
+                    snr_p_mean = snr_stack.mean()
+                    snr_p_min  = snr_stack.min()
+
+                # # -------- reconstruct full-resolution video via depatchify --------
+                # # per-channel overlap-add
+                # r_rec_patches = torch.stack([xh[0] for xh in xhat_list], dim=0)  # [N,t,h,w]
+                # i_rec_patches = torch.stack([xh[1] for xh in xhat_list], dim=0)  # [N,t,h,w]
+
+                # xhat_r = depatchify(r_rec_patches, (T, H, W), patch_size, strides)  # [T,H,W]
+                # xhat_i = depatchify(i_rec_patches, (T, H, W), patch_size, strides)  # [T,H,W]
+                # xhat   = torch.stack((xhat_r, xhat_i), dim=0)                        # [2,T,H,W]
+                r_rec_patches = torch.stack([xh[0] for xh in xhat_list], dim=0)  # [N,t,h,w]
+                i_rec_patches = torch.stack([xh[1] for xh in xhat_list], dim=0)
+
+                xhat_r = _depatchify_fixed_stride(r_rec_patches, (T, H, W), patch_size, strides_fixed, W3D)
+                xhat_i = _depatchify_fixed_stride(i_rec_patches, (T, H, W), patch_size, strides_fixed, W3D)
+                xhat   = torch.stack((xhat_r, xhat_i), dim=0)  # [2,T,H,W]
 
                 # -------- compute reconstruction metrics on FULL video --------
-                if self.cfg["loss"][self.mode]["complex_l1"]:
-                    img_loss = self._charb_l1(xhat, x)
-                    k_loss   = self._charb_l1(self._fft2c(xhat), self._fft2c(x))
-                else:
-                    img_loss = self._charb_l1_mag(xhat, x)
-                    k_loss   = self._charb_l1_mag(self._fft2c(xhat), self._fft2c(x))
+                                # --- full-video metrics ---
+                mse_c  = self._mse_complex(xhat, x)
+                l1mag  = self._l1_mag(xhat, x)
+
+                # k-space diagnostic (magnitude L1), optional but useful:
+                k_loss = self._l1_mag(self._fft2c(xhat), self._fft2c(x))
 
                 lpips_loss = self._lpips_loss_item(x, xhat, mode=("pretrain_2d" if T==1 else "videos"))
 
@@ -987,14 +1194,18 @@ class CardiacVAETrainer:
                 # Compose total with current weights (do NOT add k into total)
                 w = self.current_w
                 if self.mode == "pretrain_2d":
-                    total = (w["img"] * img_loss + w["lpips"] * lpips_loss + w["kl"] * kl)
+                    total = (w["mse"] * mse_c + w["l1"] * l1mag + w["lpips"] * lpips_loss + w["kl"] * kl)
                 else:
-                    total = (w["img"] * img_loss + w["lpips"] * lpips_loss + w["tvz"] * tvz + w["kl"] * kl)
+                    total = (w["mse"] * mse_c + w["l1"] * l1mag + w["lpips"] * lpips_loss + w["tvz"] * tvz + w["kl"] * kl)
 
                 # -------- accumulate meters (per video) --------
-                met = {"total": total, "img": img_loss, "k": k_loss, "kl": kl, "lpips": lpips_loss}
+                met = {
+                    "total": total, "mse": mse_c, "l1": l1mag, "k": k_loss, "kl": kl, "lpips": lpips_loss,
+                    "patch_snr_mean": snr_p_mean, "patch_snr_min": snr_p_min
+                }
                 if self.mode == "videos":
                     met["tvz"] = tvz
+
                 for k in keys:
                     meters_sum[k] += met[k].detach().to(device=device, dtype=torch.float32)
                 items_cnt += 1.0
@@ -1003,8 +1214,6 @@ class CardiacVAETrainer:
                 xm  = self._complex_mag(x)
                 xhm = self._complex_mag(xhat)
                 diff = xhm - xm
-                sse_mag_rank += (diff * diff).sum().to(device)
-                cnt_mag_rank += float(xm.numel())
 
                 # -------- SNR accum on complex signal (real/imag jointly) --------
                 # SNR(xhat,x) [dB] = 10*log10( ||x||^2 / ||xhat-x||^2 )
@@ -1012,6 +1221,7 @@ class CardiacVAETrainer:
                 err = (xhat - x)
                 energy_sig_rank += (x * x).sum().to(device)
                 energy_err_rank += (err * err).sum().to(device)
+                n_elem_rank     += float(x.numel())  # counts 2*T*H*W
 
                 # -------- One-time visuals --------
                 if self.accelerator.is_main_process and not logged_media:
@@ -1032,74 +1242,10 @@ class CardiacVAETrainer:
                         wandb.log(media, step=self.global_step)
                     logged_media = True
 
-                # -------- Patchify/Depatchify sanity visualization (main only, once) --------
-                if self.accelerator.is_main_process and not logged_patchviz:
-                    try:
-                        # Use the SAME sample x processed above
-                        _, T_v, H_v, W_v = x.shape
-                        t_mid = T_v // 2
-
-                        # Prepare magnitude volume in (H, W, T) for patch ops
-                        xm_v   = self._complex_mag(x).squeeze(0)          # [T,H,W]
-                        data3d = xm_v.permute(1, 2, 0).contiguous()       # [H,W,T]
-
-                        # Patch params (spatial 80×80, temporal 11)
-                        P0, P1, P2 = 80, 80, 11
-                        patch_size_viz = (P0, P1, P2)
-
-                        # Compute strides and number of patches
-                        strides_viz, _, n_list = compute_strides_and_N(data3d.shape, patch_size_viz)
-                        S0, S1, S2 = strides_viz
-                        n0, n1, n2 = n_list
-
-                        # Identity patchify/depatchify on GT (no VAE)
-                        patches_viz, strides_rt = patchify(data3d, patch_size_viz)      # [N, P0, P1, P2]
-                        id_recon = depatchify(patches_viz, data_shape=data3d.shape,
-                                            patch_size=patch_size_viz, strides=strides_rt)  # [H,W,T]
-
-                        # Panels at mid-frame (0..255)
-                        def _to_uint8_2d(m_2d: torch.Tensor) -> np.ndarray:
-                            return self._frame_to_uint8(m_2d.unsqueeze(0))
-
-                        gt_mid  = _to_uint8_2d(data3d[:, :, t_mid])
-                        id_mid  = _to_uint8_2d(id_recon[:, :, t_mid])
-                        diff    = (torch.abs(id_recon[:, :, t_mid] - data3d[:, :, t_mid]) * 4.0).clamp(0, 1.0)
-                        diff_u8 = (diff.detach().cpu().numpy() * 255.0).round().astype(np.uint8)
-
-                        # Overlay grid on GT
-                        grid = np.stack([gt_mid, gt_mid, gt_mid], axis=-1)      # [H,W,3] RGB
-                        # Horizontal (red)
-                        for i_ in range(n0):
-                            y0 = i_ * S0
-                            y1 = min(y0 + P0, H_v) - 1
-                            if 0 <= y0 < H_v: grid[y0, :, :] = [255, 0, 0]
-                            if 0 <= y1 < H_v: grid[y1, :, :] = [255, 0, 0]
-                        # Vertical (green)
-                        for j_ in range(n1):
-                            x0 = j_ * S1
-                            x1 = min(x0 + P1, W_v) - 1
-                            if 0 <= x0 < W_v: grid[:, x0, :] = [0, 255, 0]
-                            if 0 <= x1 < W_v: grid[:, x1, :] = [0, 255, 0]
-
-                        panel = np.concatenate([
-                            np.stack([gt_mid]*3, axis=-1),
-                            grid,
-                            np.stack([id_mid]*3, axis=-1),
-                            np.stack([diff_u8]*3, axis=-1),
-                        ], axis=1)  # [H, 4*W, 3]
-
-                        wandb.log(
-                            {"vis/patchify_depatchify_debug": wandb.Image(panel,
-                            caption=f"GT | GT+grid | Identity(repatch) | |GT−ID|×4 @ t={t_mid}")},
-                            step=self.global_step
-                        )
-                        logged_patchviz = True
-                    except Exception as e:
-                        self.accelerator.print(f"[viz] patchify/depatchify panel skipped: {e}")
-
                 # -------- One-time latent diagnostics (use first patch’s mu/z) --------
                 if self.accelerator.is_main_process and not logged_latents and len(mu_list) > 0:
                     mu0, logv0, z0 = mu_list[0], logv_list[0], z_list[0]      # [Cz,n,H',W']
+                    print(mu0.shape)
                     self._log_latent_images(mu0, z0, step=self.global_step, prefix="vis/latent")
                     if self.mode == "videos":
                         fps = int(self.cfg["logging"].get("latent_grid_fps", 4))
@@ -1133,22 +1279,20 @@ class CardiacVAETrainer:
         for k, vec in g_sums.items():
             global_means[k] = float(vec.sum().item() / float(denom))
 
-        sse_all = self.accelerator.gather_for_metrics(sse_mag_rank)
-        cnt_all = self.accelerator.gather_for_metrics(cnt_mag_rank)
-        sse_sum = sse_all.sum()
-        cnt_sum = cnt_all.sum().clamp_min(1.0)
-        mse_mag = sse_sum / cnt_sum
-        max_I   = torch.sqrt(torch.tensor(2.0, device=device))
-        psnr    = 10.0 * torch.log10((max_I * max_I) / mse_mag.clamp_min(1e-12))
-        global_means["psnr_mag"] = float(psnr.detach().cpu().item())
-
         # -------- finalize complex SNR over entire validation set --------
-        sig_all = self.accelerator.gather_for_metrics(energy_sig_rank)
-        err_all = self.accelerator.gather_for_metrics(energy_err_rank)
-        sig_sum = sig_all.sum().clamp_min(1e-12)
-        err_sum = err_all.sum().clamp_min(1e-12)
-        snr_db  = 10.0 * torch.log10(sig_sum / err_sum)
-        global_means["snr_complex"] = float(snr_db.detach().cpu().item())
+        n_all   = self.accelerator.gather_for_metrics(n_elem_rank).sum().clamp_min(1.0)
+        sig_all = self.accelerator.gather_for_metrics(energy_sig_rank).sum().clamp_min(1e-12)
+        err_all = self.accelerator.gather_for_metrics(energy_err_rank).sum().clamp_min(1e-12)
+        
+        power_mean = sig_all / n_all
+        mse_c_mean = err_all / n_all
+        snr_db     = 10.0 * torch.log10(sig_all / err_all)
+
+        global_means["signal_power_mean"] = float(power_mean.detach().cpu())
+        global_means["mse_complex"]       = float(mse_c_mean.detach().cpu())
+        global_means["snr_complex"]       = float(snr_db.detach().cpu())
+        # optional consistency check (should match snr_complex within ~1e-3 dB):
+        global_means["snr_from_means"]    = float((10.0*torch.log10(power_mean/mse_c_mean.clamp_min(1e-12))).detach().cpu())
 
         # ---------------- logging ----------------
         if self.accelerator.is_main_process:
@@ -1158,6 +1302,7 @@ class CardiacVAETrainer:
                 " ".join([f"{k}={v:.4f}" for k, v in global_means.items()])
             )
 
+        self.ema.restore(unwrapped)
         self.model.train()
 
     def _avg_losses_across_gpus(self, stats: dict, count: int) -> dict:
@@ -1193,6 +1338,7 @@ class CardiacVAETrainer:
             "optimizer": self.optimizer.state_dict(),
             "cfg": self.cfg,
             "global_step": self.global_step,
+            "ema": self.ema.shadow,
         }
         if self.scheduler is not None:
             state["scheduler"] = self.scheduler.state_dict()
@@ -1249,6 +1395,25 @@ def main(config_path: str):
     if pretrained_path and os.path.isfile(pretrained_path):
         ckpt = torch.load(pretrained_path, map_location="cpu")
         state = ckpt.get("model", ckpt)
+        if "ema" in ckpt and not cfg['model']['resume']:
+            print(f"[VAE] loaded EMA weights from {pretrained_path}")
+            state = ckpt.get("ema", ckpt)
+        else:
+            print(f"[VAE] loaded non-EMA weights from {pretrained_path}")
+
+        new_sd = OrderedDict()
+        changed = 0
+        prefixes = ["_orig_mod."]
+        for k, v in state.items():
+            nk = k
+            for p in prefixes:
+                if nk.startswith(p):
+                    nk = nk[len(p):]
+            if nk != k:
+                changed += 1
+            new_sd[nk] = v
+        
+        state = new_sd
         missing, unexpected = model.load_state_dict(state, strict=strict_load)
         print(f"[VAE] loaded pretrained from {pretrained_path}")
         if not strict_load:
