@@ -94,7 +94,7 @@ loss:
 validation:
   patch_h: 80
   patch_w: 80
-  patch_t: 9      # temporal size (videos). For pretrain_2d we use 1.
+  patch_t: 7      # temporal size (videos). For pretrain_2d we use 1.
   patch_batch: 32  # how many patches to run through the VAE at once
 
 # Logging / Validation / Checkpoints

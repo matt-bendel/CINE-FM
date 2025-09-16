@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUT_ROOT="/storage/CINE_data"
+OUT_ROOT="/storage/CINE_data" # TODO!!
 PCTL=99.5
 SHARD=64
 COMP="lzf"
 
+# TODO!!
 # ---- EDIT THESE ARRAYS ----
 TRAIN_PKLS=(
   "/storage/training_max1_ocmr232425_CS.pkl"
@@ -57,3 +58,15 @@ for PKL in "${TEST_PKLS[@]}"; do
 done
 
 echo "All splits updated under $OUT_ROOT/{train,val,test}"
+
+# TODO!!
+echo "=== TRAIN LATENTS ==="
+python utils/precompute_latents.py \
+  --config configs/vae.yaml \
+  --in_root "$OUT_ROOT" \
+  --out_root "$OUT_ROOT/latents" \
+  --split train \
+  --vae_import CardiacVAE.model.vae \
+  --vae_class CardiacVAE \
+  --vae_ckpt /storage/matt_models/cardiac_vae/videos/step_0195000/state.pt \
+  --strict_load \

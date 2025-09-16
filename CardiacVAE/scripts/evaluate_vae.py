@@ -2,6 +2,7 @@
 import os, sys, json, math, random, argparse
 from math import ceil
 from typing import Dict, Any, List, Tuple
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -16,7 +17,7 @@ if LAUNCH_ROOT not in sys.path:
 from data.cine_dataset import CINEDataset  # returns [2,1,H,W] (pretrain_2d) or [2,L,H,W] (videos)
 
 # ======================= Patch helpers =======================
-# (legacy helpers kept for compatibility; main loop uses the new fixed-stride OA)
+# (legacy helpers kept for compatibility; some are unused in the new pipeline)
 def compute_stride_and_n_patches(D, P, extra_patch_num=0):
     n_patches = 1
     while True:
@@ -41,7 +42,7 @@ def compute_stride_and_n_patches(D, P, extra_patch_num=0):
         S = max(S, 1)
     return S, n_patches
 
-def compute_strides_and_N(data_shape, patch_size=(80, 80, 11), extra_patch_num=(0,0,0)):
+def compute_strides_and_N(data_shape, patch_size=(80, 80, 7), extra_patch_num=(0,0,0)):
     strides = []
     n_patches_list = []
     for D, P, extra in zip(data_shape, patch_size, extra_patch_num):
@@ -51,7 +52,17 @@ def compute_strides_and_N(data_shape, patch_size=(80, 80, 11), extra_patch_num=(
     N = torch.prod(torch.tensor(n_patches_list))
     return tuple(strides), N.item(), tuple(n_patches_list)
 
-# --- NEW fixed 50% overlap + Hann window helpers (validation-style) ---
+# ---- NEW: overlap% → stride utility (spatial only; temporal fixed to 1-frame overlap) ----
+def _pct_to_stride(patch_len: int, overlap_pct: float) -> int:
+    """
+    Convert overlap percentage to stride length for one axis.
+    overlap_pct in [0, 99]; stride = ceil(patch_len * (1 - overlap)).
+    Example: patch=80, overlap=25% → stride=ceil(60)=60.
+    """
+    ov = max(0.0, min(99.0, float(overlap_pct))) / 100.0
+    return max(1, int(math.ceil(patch_len * (1.0 - ov))))
+
+# --- fixed-stride patchify + index-aware OA (fast, stable) ---
 def _hann3d(t: int, h: int, w: int, device) -> torch.Tensor:
     wt = torch.hann_window(t, periodic=False, device=device).view(t, 1, 1) if t > 1 else torch.ones((t, 1, 1), device=device)
     wh = torch.hann_window(h, periodic=False, device=device).view(1, h, 1)
@@ -82,38 +93,91 @@ def _patchify_fixed_stride(vol_thw: torch.Tensor, patch_size: Tuple[int,int,int]
                 idx += 1
     return patches  # [N,t,h,w]
 
-def _depatchify_fixed_stride(patches: torch.Tensor, data_shape: Tuple[int,int,int],
-                             patch_size: Tuple[int,int,int], strides: Tuple[int,int,int],
-                             window_3d: torch.Tensor):
-    # patches: [N, P0,P1,P2]; window_3d: [P0,P1,P2]
+def _depatchify_fixed_stride(
+    patches: torch.Tensor,                     # [N, P0,P1,P2]
+    data_shape: Tuple[int,int,int],            # (T_, H_, W_)
+    patch_size: Tuple[int,int,int],            # (P0, P1, P2)
+    strides: Tuple[int,int,int],               # (S0, S1, S2)
+    window_3d: torch.Tensor,                   # unused; kept for compatibility
+):
+    """
+    Overlap-add with index-aware ramps so boundary voxels keep weight 1
+    (avoids Hann-at-zero problem that blacks out the first frame).
+    """
     P0, P1, P2 = patch_size
     S0, S1, S2 = strides
     T_, H_, W_ = data_shape
+
     n0 = max(1, math.ceil((T_ - P0) / S0) + 1)
     n1 = max(1, math.ceil((H_ - P1) / S1) + 1)
     n2 = max(1, math.ceil((W_ - P2) / S2) + 1)
     expected = n0 * n1 * n2
     if int(patches.shape[0]) != expected:
-        raise RuntimeError(f"depatchify: N={patches.shape[0]} but expected {expected} for shape={data_shape}, P={patch_size}, S={strides}")
+        raise RuntimeError(
+            f"depatchify: N={patches.shape[0]} but expected {expected} for "
+            f"shape={data_shape}, P={patch_size}, S={strides}"
+        )
 
-    out_num = torch.zeros((T_, H_, W_), dtype=patches.dtype, device=patches.device)
-    out_den = torch.zeros((T_, H_, W_), dtype=torch.float32, device=patches.device)
+    device = patches.device
+    dtype  = patches.dtype
+
+    out_num = torch.zeros((T_, H_, W_), dtype=dtype, device=device)
+    out_den = torch.zeros((T_, H_, W_), dtype=torch.float32, device=device)
+
+    # Overlap extents
+    O0 = max(0, P0 - S0)
+    O1 = max(0, P1 - S1)
+    O2 = max(0, P2 - S2)
+
+    def axis_weights(L_eff: int, idx: int, n: int, O: int) -> torch.Tensor:
+        """
+        Build per-axis weights for a valid slice length L_eff of this patch along one axis.
+        Boundary slices keep weight=1; overlaps get smooth ramps.
+        """
+        has_prev = (idx > 0)
+        has_next = (idx < n - 1)
+
+        L_left  = min(O if has_prev else 0, L_eff)
+        L_right = min(O if has_next else 0, L_eff)
+
+        # If ramps would exceed the valid length, re-split reasonably
+        if L_left + L_right > L_eff:
+            if L_left > 0 and L_right > 0:
+                total = L_left + L_right
+                L_left_new  = max(1, int(round(L_eff * (L_left / total))))
+                L_right_new = L_eff - L_left_new
+                L_left, L_right = L_left_new, L_right_new
+            else:
+                L_left  = min(L_left,  L_eff)
+                L_right = L_eff - L_left
+
+        w = torch.ones(L_eff, dtype=torch.float32, device=device)
+        if L_left > 0:
+            w[:L_left] = 0.5 if L_left == 1 else torch.linspace(0.0, 1.0, steps=L_left, device=device)
+        if L_right > 0:
+            w[-L_right:] = 0.5 if L_right == 1 else torch.linspace(1.0, 0.0, steps=L_right, device=device)
+        return w
 
     idx = 0
     for i in range(n0):
         t0 = i * S0; t1 = min(t0 + P0, T_); s0 = t1 - t0
+        w0 = axis_weights(s0, i, n0, O0)
         for j in range(n1):
             y0 = j * S1; y1 = min(y0 + P1, H_); s1 = y1 - y0
+            w1 = axis_weights(s1, j, n1, O1)
             for k in range(n2):
                 x0 = k * S2; x1 = min(x0 + P2, W_); s2 = x1 - x0
-                w = window_3d[:s0, :s1, :s2]
+                w2 = axis_weights(s2, k, n2, O2)
+
+                w = (w0[:, None, None] * w1[None, :, None] * w2[None, None, :])
                 p = patches[idx][:s0, :s1, :s2]
+
                 out_num[t0:t1, y0:y1, x0:x1] += (p * w).to(out_num.dtype)
-                out_den[t0:t1, y0:y1, x0:x1] += w.to(out_den.dtype)
+                out_den[t0:t1, y0:y1, x0:x1] += w
                 idx += 1
 
     out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
-    return (out_num / out_den.to(out_num.dtype))  # [T,H,W]
+    return out_num / out_den.to(out_num.dtype)
 
 def ragged_collate(batch):  # keep ragged batch (list of tensors)
     return batch
@@ -241,6 +305,7 @@ def save_error_visuals(x: torch.Tensor, xhat: torch.Tensor, out_dir: str, sample
 # ======================= Smoothness & Gaussianity =======================
 @torch.no_grad()
 def tv3d(z: torch.Tensor) -> float:  # z: [Cz, n, H, W]
+    if z is None: return float("nan")
     parts = []
     if z.size(1) > 1: parts.append((z[:, 1:] - z[:, :-1]).abs().mean())
     if z.size(2) > 1: parts.append((z[:, :, 1:] - z[:, :, :-1]).abs().mean())
@@ -250,7 +315,7 @@ def tv3d(z: torch.Tensor) -> float:  # z: [Cz, n, H, W]
 
 @torch.no_grad()
 def temporal_jerk(z: torch.Tensor) -> float:
-    if z.shape[1] < 3: return float("nan")
+    if (z is None) or (z.shape[1] < 3): return float("nan")
     j = (z[:, 2:] - 2*z[:, 1:-1] + z[:, :-2]).abs().mean()
     return j.item()
 
@@ -379,37 +444,47 @@ def locality_psf_metrics(decoder_fn, z: torch.Tensor, eps: float = 0.1, probes: 
 # ======================= Robustness (full patch pipeline) =======================
 @torch.no_grad()
 def robustness_metrics_full_pipeline(model, x_full: torch.Tensor, patch_size, patch_bs: int,
-                                     noise_sigma: float = 0.02, phase_deg: float = 5.0) -> Dict[str, float]:
+                                     noise_sigma: float = 0.02, phase_deg: float = 5.0,
+                                     autocast_ctx_factory=None,
+                                     overlap_spatial_pct: float = 50.0) -> Dict[str, float]:
     """
-    Measures robustness through the SAME (new) fixed-stride Hann OA patchify->model->depatchify pipeline.
-    Latent change uses the concatenated deterministic μ vectors (no sampling).
+    Measures robustness through the SAME fixed-stride OA patchify->model->depatchify pipeline.
+    Spatial overlap is controlled by overlap_spatial_pct; TEMPORAL OVERLAP IS FIXED TO 1 FRAME.
+    Deterministic μ (no sampling).
     """
     device = x_full.device
     _, T, H, W = x_full.shape
     P_t, P_h, P_w = patch_size
 
     def _forward_full(x):
-        S0 = max(1, P_t // 2); S1 = max(1, P_h // 2); S2 = max(1, P_w // 2)
-        W3D = _hann3d(P_t if T > 1 else 1, P_h, P_w, x.device)
+        # Spatial strides from overlap%; Temporal stride = P_t - 1 (1-frame overlap) for videos, else 1
+        S1 = _pct_to_stride(P_h, overlap_spatial_pct)
+        S2 = _pct_to_stride(P_w, overlap_spatial_pct)
+        S0 = (P_t - 1) if (T > 1 and P_t > 1) else 1
+        _ = _hann3d(P_t if T > 1 else 1, P_h, P_w, x.device)  # (not used in OA, kept for compat)
         r_p = _patchify_fixed_stride(x[0], (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2))
         i_p = _patchify_fixed_stride(x[1], (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2))
         Np = int(r_p.shape[0])
-        patches = [ torch.stack((r_p[n], i_p[n]), dim=0).to(device) for n in range(Np) ]
+
+        patches_2thw = torch.stack((r_p, i_p), dim=1)
 
         xhat_list, mu_list = [], []
         for i in range(0, Np, patch_bs):
-            chunk = patches[i:i+patch_bs]                 # list of [2,t,h,w]
-            enc_pairs = model(chunk, op="encode")         # list of (mu, logv)
-            mus = [mu for (mu, _lv) in enc_pairs]
-            xhats = model.decode(mus)                     # list of [B=1,2,t,h,w]
+            sub = patches_2thw[i:i+patch_bs]                 # [B,2,t,h,w]
+            chunk = [sub[n] for n in range(sub.size(0))]     # list of [2,t,h,w]
+            ctx = autocast_ctx_factory() if autocast_ctx_factory is not None else nullcontext()
+            with ctx:
+                enc_pairs = model(chunk, op="encode")        # list of (mu, logv)
+                mus = [mu for (mu, _lv) in enc_pairs]
+                xhats = model.decode(mus)                    # list of [1,2,t,h,w]
             for xh, mu in zip(xhats, mus):
                 xhat_list.append(xh.squeeze(0))
                 mu_list.append(mu.squeeze(0))
 
         r_rec = torch.stack([xh[0] for xh in xhat_list], dim=0)
         i_rec = torch.stack([xh[1] for xh in xhat_list], dim=0)
-        xhat_r = _depatchify_fixed_stride(r_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2), W3D)
-        xhat_i = _depatchify_fixed_stride(i_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2), W3D)
+        xhat_r = _depatchify_fixed_stride(r_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2), None)
+        xhat_i = _depatchify_fixed_stride(i_rec, (T, H, W), (P_t if T>1 else 1, P_h, P_w), (S0, S1, S2), None)
         xhat   = torch.stack((xhat_r, xhat_i), dim=0)
         return xhat, mu_list
 
@@ -525,11 +600,27 @@ def save_cmr_image_matplotlib(img_1hw: torch.Tensor, path: str, percentile: floa
 def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
              max_items: int = 64, probes: int = 4, locality_eps: float = 0.1,
              noise_sigma: float = 0.02, phase_deg: float = 5.0,
-             vis_max: int = 8, hist_max_ch: int = 16, hist_bins: int = 51):
+             vis_max: int = 8, hist_max_ch: int = 16, hist_bins: int = 51,
+             args=None):
 
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
+
+    # ---- Fast/skip switches & AMP ----
+    fast = bool(cfg.get("eval_fast", False)) or bool(getattr(args, "fast", False))
+    skip_robustness = fast or bool(getattr(args, "skip_robustness", False))
+    skip_locality   = fast or bool(getattr(args, "skip_locality",   False))
+    skip_lpips      = fast or bool(getattr(args, "skip_lpips",      False))
+    no_viz          = fast or bool(getattr(args, "no_viz",          False))
+
+    use_amp = torch.cuda.is_available()
+    amp_dtype = torch.float32 #torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    autocast_ctx_factory = (lambda: torch.autocast(device_type="cuda", dtype=amp_dtype)) if use_amp else (lambda: nullcontext())
+
+    if fast:
+        # reduce Gaussianity work
+        cfg["gauss_subsample_positions"] = min(int(cfg.get("gauss_subsample_positions", 8192)), 2048)
 
     if _HAS_LPIPS and _LPIPS_NET is not None:
         _LPIPS_NET.to(device)
@@ -574,8 +665,13 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
     vcfg = cfg.get("validation", {})
     patch_h = int(vcfg.get("patch_h", 80))
     patch_w = int(vcfg.get("patch_w", 80))
-    patch_t_default = int(vcfg.get("patch_t", 11))  # used if T>1
+    patch_t_default = int(vcfg.get("patch_t", 7))  # used if T>1
     patch_bs = int(vcfg.get("patch_batch", 32))
+    if getattr(args, "patch_batch", None):
+        patch_bs = int(args.patch_batch)
+
+    # Spatial overlap percent (CLI) → strides for H/W; temporal overlap is fixed to 1 frame
+    overlap_spatial_pct = float(getattr(args, "overlap", 50.0))
 
     # ---- Accumulators ----
     per_sample_rows = []
@@ -611,48 +707,54 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
             patch_t = (patch_t_default if is_video else 1)
             patch_size = (patch_t, patch_h, patch_w)
 
-            # --- NEW Patchify (fixed 50% overlap + Hann OA) ---
-            S0 = max(1, patch_t // 2); S1 = max(1, patch_h // 2); S2 = max(1, patch_w // 2)
+            # --- Patchify with user-controlled spatial overlap; temporal overlap = 1 frame ---
+            S1 = _pct_to_stride(patch_h, overlap_spatial_pct)
+            S2 = _pct_to_stride(patch_w, overlap_spatial_pct)
+            S0 = (patch_t - 1) if (is_video and patch_t > 1) else 1  # EXACTLY 1-frame temporal overlap
             strides_fixed = (S0, S1, S2)
-            W3D = _hann3d(patch_t if T>1 else 1, patch_h, patch_w, x.device)
+            _ = _hann3d(patch_t if T>1 else 1, patch_h, patch_w, x.device)  # kept for compatibility
 
-            r_p = _patchify_fixed_stride(x[0], (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed)
+            r_p = _patchify_fixed_stride(x[0], (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed)  # [N,t,h,w]
             i_p = _patchify_fixed_stride(x[1], (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed)
-            Np = int(r_p.shape[0])
-            patches = [ torch.stack((r_p[n], i_p[n]), dim=0).to(device) for n in range(Np) ]
+            Np  = int(r_p.shape[0])
 
-            # --- Deterministic forward (μ only) in micro-batches ---
+            # Stack once: [N,2,t,h,w]
+            patches_2thw = torch.stack((r_p, i_p), dim=1)
+
+            # --- Deterministic forward (μ only) in larger micro-batches + AMP ---
             xhat_list, mu_list, logv_list = [], [], []
             for i in range(0, Np, patch_bs):
-                chunk = patches[i:i+patch_bs]               # list of [2,t,h,w]
-                enc_pairs = model(chunk, op="encode")       # list of (mu, logv)
-                mus  = [mu for (mu, _lv) in enc_pairs]
-                xhats = model.decode(mus)                   # list of [B=1,2,t,h,w]
+                sub = patches_2thw[i:i+patch_bs]                           # [B,2,t,h,w]
+                chunk = [sub[n] for n in range(sub.size(0))]               # list of [2,t,h,w]
+                with autocast_ctx_factory():
+                    enc_pairs = model(chunk, op="encode")                  # list of (mu, logv)
+                    mus       = [mu for (mu, _lv) in enc_pairs]
+                    xhats     = model.decode(mus)                          # list of [1,2,t,h,w]
                 for xh, (mu, lv) in zip(xhats, enc_pairs):
-                    xhat_list.append(xh.squeeze(0))         # [2,t,h,w]
-                    mu_list.append(mu.squeeze(0))           # [Cz,n,H',W']
+                    xhat_list.append(xh.squeeze(0))                        # [2,t,h,w]
+                    mu_list.append(mu.squeeze(0))                          # [Cz,n,H',W']
                     logv_list.append(lv.squeeze(0))
 
-            # --- Depatchify to full recon (Hann OA) ---
+            # --- Depatchify to full recon (index-aware OA) ---
             r_rec = torch.stack([xh[0] for xh in xhat_list], dim=0)
             i_rec = torch.stack([xh[1] for xh in xhat_list], dim=0)
-            xhat_r = _depatchify_fixed_stride(r_rec, (T, H, W), (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed, W3D)
-            xhat_i = _depatchify_fixed_stride(i_rec, (T, H, W), (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed, W3D)
-            xhat   = torch.stack((xhat_r, xhat_i), dim=0)  # [2,T,H,W]
+            xhat_r = _depatchify_fixed_stride(r_rec, (T, H, W), (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed, None)
+            xhat_i = _depatchify_fixed_stride(i_rec, (T, H, W), (patch_t if T>1 else 1, patch_h, patch_w), strides_fixed, None)
+            xhat   = torch.stack((xhat_r, xhat_i), dim=0)                  # [2,T,H,W]
 
             # --- Full-image metrics ---
             snr_c  = snr_complex(x, xhat)
             l1_img = charb_l1(x, xhat)
-            l1k    = charb_l1(fft2c(x), fft2c(xhat))
-            lpips_m = lpips_on_full(x, xhat)
+            l1k    = charb_l1(fft2c(x.float()), fft2c(xhat.float()))
+            lpips_m = float("nan") if skip_lpips else lpips_on_full(x, xhat)
 
             # --- Smoothness (μ aggregated across patches) ---
             mu_cat = torch.cat(mu_list, dim=1) if len(mu_list) > 0 else None  # [Cz, sum_n, H', W']
-            tv = tv3d(mu_cat) if mu_cat is not None else float("nan")
-            jerk = temporal_jerk(mu_cat) if mu_cat is not None else float("nan")
+            tv = tv3d(mu_cat)
+            jerk = temporal_jerk(mu_cat)
 
-            # --- Locality (decoder PSF) using ONE representative patch ---
-            if hasattr(model, "decode") and len(mu_list) > 0:
+            # --- Locality (decoder PSF) using ONE representative patch (optional) ---
+            if (not skip_locality) and hasattr(model, "decode") and len(mu_list) > 0:
                 def decode_patch(Z):
                     out = model.decode([Z])
                     return out[0] if isinstance(out, list) else out
@@ -662,11 +764,23 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                 loc = {"locality_temporal_spread_frames_mean": float("nan"),
                        "locality_spatial_rms_px_mean": float("nan")}
 
-            # --- Robustness through FULL (new) patch pipeline (deterministic) ---
-            rob = robustness_metrics_full_pipeline(
-                model, x, patch_size=patch_size, patch_bs=patch_bs,
-                noise_sigma=noise_sigma, phase_deg=phase_deg
-            )
+            # --- Robustness through FULL patch pipeline (optional) ---
+            if not skip_robustness:
+                rob = robustness_metrics_full_pipeline(
+                    model, x, patch_size=patch_size, patch_bs=patch_bs,
+                    noise_sigma=noise_sigma, phase_deg=phase_deg,
+                    autocast_ctx_factory=autocast_ctx_factory if use_amp else None,
+                    overlap_spatial_pct=overlap_spatial_pct,
+                )
+            else:
+                rob = {
+                    "robust_latent_relchange_noise": float("nan"),
+                    "robust_latent_relchange_phase": float("nan"),
+                    "robust_latent_relchange_roll":  float("nan"),
+                    "robust_snr_noise": float("nan"),
+                    "robust_snr_phase": float("nan"),
+                    "robust_snr_roll":  float("nan"),
+                }
 
             # --- Gaussianity accumulation (store RAW mu, standardize later) ---
             subsample_positions = int(cfg.get("gauss_subsample_positions", 8192))
@@ -679,8 +793,8 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                     mu_flat = mu_flat[idx]
                 MU_chunks.append(mu_flat.detach().cpu())
 
-            # --- Visualizations (capped by vis_max) ---
-            save_vis = (n_done < int(vis_max))
+            # --- Visualizations (capped by vis_max; can be disabled) ---
+            save_vis = (not no_viz) and (n_done < int(vis_max))
             if save_vis:
                 import imageio.v2 as iio
                 xm  = complex_mag(x)    # [1,T,H,W]
@@ -726,7 +840,7 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
                                     (grid * 255.0).astype(np.uint8))
 
                 # PSF panel (optional quick viz)
-                if hasattr(model, "decode") and len(mu_list) > 0:
+                if (not skip_locality) and hasattr(model, "decode") and len(mu_list) > 0:
                     try:
                         mu0 = mu_list[0]; z_one = mu0.unsqueeze(0)
                         def decode_patch(Z):
@@ -782,10 +896,11 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
         Z_all = (MU_all - mean) / std
         gauss = channel_gaussianity_stats(Z_all)
         gauss["cov_offdiag_abs_mean"] = offdiag_cov_abs_mean(Z_all)
-        try:
-            save_channel_histograms(Z_all.cpu(), out_dir, max_ch=int(hist_max_ch), bins=int(hist_bins))
-        except Exception as e:
-            print(f"[viz] histogram save failed: {e}")
+        if not fast:
+            try:
+                save_channel_histograms(Z_all.cpu(), out_dir, max_ch=int(hist_max_ch), bins=int(hist_bins))
+            except Exception as e:
+                print(f"[viz] histogram save failed: {e}")
     else:
         gauss = {"skew_abs_mean": float("nan"), "kurtosis_mean": float("nan"),
                  "jb_reject_rate": float("nan"), "std_mean": float("nan"),
@@ -800,7 +915,7 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
     summary.update({ f"gauss/{k}": v for k, v in gauss.items() })
     summary["num_items"] = n_done
     summary["mode"] = mode_known or "unknown"
-    summary["lpips_used"] = bool(_HAS_LPIPS)
+    summary["lpips_used"] = (not skip_lpips) and bool(_HAS_LPIPS)
 
     # ---- Save ----
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
@@ -824,7 +939,7 @@ def evaluate(cfg: Dict[str, Any], ckpt_path: str, out_dir: str,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/vae.yaml", help="YAML config path")
-    ap.add_argument("--ckpt",   type=str, default="/storage/matt_models/cardiac_vae/pretrain_2d/step_0060000/state.pt", help="Path to checkpoint .pt (state.pt)")
+    ap.add_argument("--ckpt",   type=str, default="/storage/matt_models/cardiac_vae/videos/step_0195000/state.pt", help="Path to checkpoint .pt (state.pt)")
     ap.add_argument("--out",    type=str, default="eval_out_ema", help="Output directory")
     ap.add_argument("--max-items", type=int, default=500, help="Max number of samples to evaluate")
     ap.add_argument("--locality-probes", type=int, default=4)
@@ -835,6 +950,19 @@ def main():
     ap.add_argument("--vis-max", type=int, default=5, help="Max number of samples to visualize")
     ap.add_argument("--hist-max-ch", type=int, default=16, help="Num channels to show in Gaussianity hist figure")
     ap.add_argument("--hist-bins", type=int, default=51, help="Bins for Gaussianity histograms")
+    # NEW: speed flags
+    ap.add_argument("--fast", action="store_true",
+                    help="Fast eval: AMP + skip robustness/locality/LPIPS/visuals/hist")
+    ap.add_argument("--skip-robustness", action="store_true")
+    ap.add_argument("--skip-locality",   action="store_true")
+    ap.add_argument("--skip-lpips",      action="store_true")
+    ap.add_argument("--no-viz",          action="store_true")
+    ap.add_argument("--patch-batch",     type=int, default=None,
+                    help="Override patch micro-batch size (default from cfg)")
+    # NEW: spatial overlap percent (temporal overlap fixed to 1 frame)
+    ap.add_argument("--overlap", type=float, default=10.0,
+                    help="Spatial overlap percent for H/W. Temporal overlap is fixed to 1 frame.")
+
     args = ap.parse_args()
 
     import yaml
@@ -851,7 +979,8 @@ def main():
              phase_deg=args.robust_phase_deg,
              vis_max=args.vis_max,
              hist_max_ch=args.hist_max_ch,
-             hist_bins=args.hist_bins)
+             hist_bins=args.hist_bins,
+             args=args)
 
 if __name__ == "__main__":
     main()

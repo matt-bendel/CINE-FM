@@ -1,4 +1,6 @@
 __pycache__/
 eval_out/
 eval_out_ema/
+eval_out_ema_pretrain2d/
 __pycache__
+third_party_packages/
