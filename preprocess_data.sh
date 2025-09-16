@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUT_ROOT="/storage/CINE_data" # TODO!!
+OUT_ROOT="/users/PAS2812/mattbendel/CINE_data" # TODO!!
 PCTL=99.5
 SHARD=64
 COMP="lzf"
@@ -9,16 +9,16 @@ COMP="lzf"
 # TODO!!
 # ---- EDIT THESE ARRAYS ----
 TRAIN_PKLS=(
-  "/storage/training_max1_ocmr232425_CS.pkl"
+  "/fs/ess/PAS2812/fullsize_ocmr232425_CS/training_max1_ocmr232425_CS.pkl"
 )
 
 VAL_PKLS=(
-  "/storage/testing_max1_ocmr232425_CS.pkl"
+  "/fs/ess/PAS2812/fullsize_ocmr232425_CS/testing_max1_ocmr232425_CS.pkl"
 )
 
 TEST_PKLS=(
-  "/storage/testing_station6_max1_ocmr232425_CS.pkl"
-  "/storage/testing_station7_max1_ocmr232425_CS.pkl"
+  "/fs/ess/PAS2812/fullsize_ocmr232425_CS/testing_station6_max1_ocmr232425_CS.pkl"
+  "/fs/ess/PAS2812/fullsize_ocmr232425_CS/testing_station7_max1_ocmr232425_CS.pkl"
 )
 
 echo "=== TRAIN ==="
@@ -68,5 +68,5 @@ python utils/precompute_latents.py \
   --split train \
   --vae_import CardiacVAE.model.vae \
   --vae_class CardiacVAE \
-  --vae_ckpt /storage/matt_models/cardiac_vae/videos/step_0195000/state.pt \
+  --vae_ckpt /users/PAS2812/mattbendel/cardiac_vae/videos/step_0195000/state.pt \
   --strict_load \
