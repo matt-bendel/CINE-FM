@@ -266,18 +266,18 @@ class SingleStreamBlock(nn.Module):
         def split_heads_bhl(z):
             return z.view(B, L, self.heads, self.head_dim).transpose(1, 2).contiguous()
 
-        q_bhl = self.q_norm(split_heads_bhl(q))  # [B,H,L,Dh]
+        v_bhl = split_heads_bhl(v)  # bf16 reference dtype
+        q_bhl = self.q_norm(split_heads_bhl(q))  # <- cast back to bf16
         k_bhl = self.k_norm(split_heads_bhl(k))
-        v_bhl = split_heads_bhl(v)
 
         # RoPE (expects [B,H,L,Dh])
         if rope_freqs is not None:
             q_bhl, k_bhl = _apply_rope_qk(q_bhl, k_bhl, rope_freqs)
 
         # Backend attention operates on [B, L, H, Dh]
-        q_blh = q_bhl.transpose(1, 2).contiguous()
-        k_blh = k_bhl.transpose(1, 2).contiguous()
-        v_blh = v_bhl.transpose(1, 2).contiguous()
+        q_blh = q_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
+        k_blh = k_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
+        v_blh = v_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
 
         attn_blh = _attn_blh(q_blh, k_blh, v_blh)  # [B,L,H,Dh]
         attn = attn_blh.transpose(1, 2).reshape(B, L, D)  # -> [B,L,D]
@@ -388,9 +388,9 @@ class LatentFlowMatchTransformer(nn.Module):
         if self.final is None:
             self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(Tg, Hg, Wg)).to(zt.device)
 
-        rope_freqs = self._rope_for_grid(Tg, Hg, Wg, zt.device)  # [L, 2*Dh] or None
+        rope_freqs = self._rope_for_grid(Tg, Hg, Wg, zt.device).to(x.dtype)  # [L, 2*Dh] or None
 
-        tvec = self.t_embed(t)  # [B,D]
+        tvec = self.t_embed(t).to(x.dtype)  # [B,D]
         for blk in self.blocks:
             x = blk(x, tvec, rope_freqs=rope_freqs)
         vel = self.final(x)  # [B,Cz,n,H,W]

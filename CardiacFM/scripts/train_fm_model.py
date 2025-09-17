@@ -22,7 +22,7 @@ from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
 from utils.ema import Ema
 
 # UniPC Flow Matching sampler (expects model(x, t, **extra_args))
-from sampler.flowmatch_unipc import sample_unipc_x
+from CardiacFM.sampler.flow_match_uni_pc import sample_unipc_x
 
 
 # ==================== FramePack-style time utilities ====================
@@ -70,7 +70,7 @@ def try_import_dataset(name: str):
     VAL/TEST: CINEDataset (raw) – unchanged
     """
     if name == "CINEFlowMatchLatentDataset":
-        mod = importlib.import_module("data.cine_fm_latent_dataset")
+        mod = importlib.import_module("data.cine_flow_dataset")
         return getattr(mod, "CINEFlowMatchLatentDataset")
     elif name in ("CINEDataset", "CINEFlowMatchDataset"):
         mod = importlib.import_module("data.cine_dataset")
@@ -193,6 +193,7 @@ class LatentFMTrainer:
         cfg['logging']['out_dir'] = os.path.join(cfg['logging']['out_dir'], "flowmatch")
         self.cfg = cfg
         self.model = model
+        self.model = torch.compile(self.model, fullgraph=False)
 
         self.t_scale = float(cfg.get("sampler", {}).get("t_scale", 1000.0))  # <<< consistent t scaling
 
@@ -294,6 +295,8 @@ class LatentFMTrainer:
 
         # time input scaled by 1000.0 (keep float, no .long())
         t_inp = (sigmas * self.t_scale)                              # bf16
+
+        print(x_t.shape, t_inp.shape)
 
         # model forward in bf16 (Accelerate autocast)
         pred = self.model(x_t, t_inp)                                # bf16
@@ -632,7 +635,7 @@ def main(config_path: str):
     val_dl   = build_dataloader(cfg["val_dataset"],   cfg["dataloader"], is_train=False)
 
     ModelClass = dynamic_import(cfg["model"]["import_path"], cfg["model"]["class_name"])
-    model = ModelClass(**cfg["model"]["args"])
+    model = ModelClass(**cfg["model"]["args"]).to(torch.bfloat16)
 
     # Optional resume / init from checkpoint (non-EMA by default)
     pretrained_path = cfg["model"].get("load_state_dict_from", None)
@@ -645,7 +648,7 @@ def main(config_path: str):
         print(f"[FM] loaded pretrained from {pretrained_path} (missing={len(missing)}, unexpected={len(unexpected)})")
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[FM] total number of model parameters: {n_params}")
+    print(f"[FM] total number of model parameters: {n_params/1e9}B")
 
     trainer = LatentFMTrainer(model, train_dl, val_dl, cfg)
     trainer.train()
@@ -653,6 +656,6 @@ def main(config_path: str):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="configs/flowmatch.yaml")
+    ap.add_argument("--config", type=str, default="configs/flow_matching.yaml")
     args = ap.parse_args()
     main(args.config)

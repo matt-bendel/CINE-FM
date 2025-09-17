@@ -14,10 +14,11 @@ class CINEFlowMatchLatentDataset(Dataset):
     VAL/TEST: falls back to CINEDataset, returning what it normally returns
       (so validation remains full VAE pipeline).
     """
-    def __init__(self, root: str, split: str, num_time_samples: int = 1):
+    def __init__(self, root: str, split: str, num_time_samples: int = 1, patch_batch: int = 8):
         self.root = root
         self.split = split
         self.num_time_samples = int(num_time_samples)
+        self.patch_batch = int(patch_batch)
 
         if split == "train":
             split_dir = os.path.join(root, split)
@@ -60,5 +61,8 @@ class CINEFlowMatchLatentDataset(Dataset):
         for ds, name in picks:
             f = self._open(ds)
             z = torch.from_numpy(f[name]["z"][()])
+            num_patches = z.shape[2]
+            patch_dim_mid = num_patches // 2
+            z = z[:, :, patch_dim_mid - self.patch_batch // 2:patch_dim_mid + self.patch_batch // 2, :, :]
             clips.append(z)
         return clips  # ragged collate keeps lists per item

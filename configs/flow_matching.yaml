@@ -3,7 +3,8 @@ train_dataset:
   args:
     root: /storage/CINE_data/latents   # NEW: where precompute wrote latents
     split: train
-    num_time_samples: 2                # same sampling semantics as before
+    num_time_samples: 1               # same sampling semantics as before
+    patch_batch: 4
 
 val_dataset:
   name: CINEFlowMatchDataset           # unchanged raw-val path (uses VAE at val)
@@ -40,11 +41,11 @@ model:
   class_name: LatentFlowMatchTransformer
   args:
     latent_channels: 16
-    hidden_size: 768
-    depth: 16
-    heads: 12
+    hidden_size: 1392
+    depth: 40
+    heads: 24
     mlp_ratio: 4.0
-    patch_size: [1, 1, 1]   # latent tokens = n'*H'*W'
+    patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
 
 optim:
   lr: 0.0002
