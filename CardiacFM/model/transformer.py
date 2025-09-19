@@ -1,10 +1,11 @@
 # models/latent_fm_transformer.py
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 
 # -----------------------------------------------------------------------------
@@ -105,6 +106,7 @@ class TimeEmbed(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         h = self.timestep_embedding(t, self.dim)
+        h = h.to(self.fc1.weight.dtype)
         h = self.fc2(self.act(self.fc1(h)))
         return h
 
@@ -137,12 +139,33 @@ class MLP(nn.Module):
         super().__init__()
         inner = int(dim * mlp_ratio)
         self.fc1 = nn.Linear(dim, inner)
+        # FramePack uses gelu-approximate / linear-silu variants; keep GELU-approx for parity
+        self.act = nn.GELU(approximate="tanh")
         self.fc2 = nn.Linear(inner, dim)
-        self.act = nn.GELU()
 
     def forward(self, x):
         return self.fc2(self.act(self.fc1(x)))
 
+
+# -----------------------------------------------------------------------------
+# RMSNorm (for Q/K parity)
+# -----------------------------------------------------------------------------
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, affine: bool = False):
+        super().__init__()
+        self.eps = eps
+        self.affine = affine
+        if affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., D]
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        y = x * rms
+        if self.weight is not None:
+            y = y * self.weight
+        return y
 
 # -----------------------------------------------------------------------------
 # RoPE for 3D grids (T/H/W), HYVideo-style
@@ -214,17 +237,40 @@ def _apply_rope_qk(q: torch.Tensor, k: torch.Tensor, rope_freqs: torch.Tensor) -
 
 
 # -----------------------------------------------------------------------------
-# Transformer block w/ RoPE and pluggable attention backend
+# AdaLN (FramePack-style) + Transformer block w/ RoPE and pluggable attention
 # -----------------------------------------------------------------------------
+class AdaLayerNormZeroSingle(nn.Module):
+    """FramePack-style AdaLN Zero (single-stream).
+    Given token states x:[B,L,D] and embedding emb:[B,D],
+    returns modulated normalized states and a single gate tensor.
+    """
+    def __init__(self, embedding_dim: int, bias: bool = True):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 3 * embedding_dim, bias=bias)
+        # elementwise_affine=False so all scale/shift comes from conditioning
+        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: [B,L,D], emb: [B,D]
+        B, L, D = x.shape
+        xn = self.norm(x)
+        # produce shift/scale/gate from embedding and broadcast across sequence
+        emb = self.linear(self.silu(emb)).unsqueeze(1)  # [B,1,3D]
+        shift, scale, gate = emb.chunk(3, dim=-1)       # [B,1,D] each
+        x_mod = xn * (1 + scale) + shift               # [B,L,D]
+        return x_mod, gate                              # gate will be broadcast later
+
+
 class SingleStreamBlock(nn.Module):
     """
-    HYVideo-lean block:
-    - pre LN
-    - fused linear to get qkv and parallel MLP stream
-    - attention backend (FA3 > FA2 > SAGE2 > SDPA) + RoPE applied to Q/K
-    - residual + gated modulation via time embedding vector
+    Single-stream Transformer block with **AdaLayerNormZero** gating (FramePack-style):
+      1) AdaLNZero -> (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+      2) Attention on modulated tokens; add residual scaled by gate_msa
+      3) Post-attn LN -> modulate with (shift_mlp, scale_mlp) -> FeedForward; add residual scaled by gate_mlp
+    Also applies RoPE to Q/K and chooses attention backend with FA3>FA2>SAGE2>SDPA.
     """
-    def __init__(self, dim, heads=16, mlp_ratio=4.0, qk_norm=True):
+    def __init__(self, dim, heads=16, mlp_ratio=4.0, qk_norm: str = "rms_norm"):
         super().__init__()
         self.dim = dim
         self.heads = heads
@@ -232,60 +278,72 @@ class SingleStreamBlock(nn.Module):
         assert self.head_dim * heads == dim, "hidden size must be divisible by heads"
         assert self.head_dim % 2 == 0, "head_dim must be even to use RoPE"
 
-        self.pre = nn.LayerNorm(dim, eps=1e-6)
+        # AdaLN Zero (produces 6 chunks)
+        class AdaLayerNormZero(nn.Module):
+            def __init__(self, embedding_dim: int, bias: bool = True):
+                super().__init__()
+                self.silu = nn.SiLU()
+                self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=bias)
+                self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+            def forward(self, x: torch.Tensor, emb: torch.Tensor):
+                # x:[B,L,D], emb:[B,D]
+                x = self.norm(x)
+                emb = self.linear(self.silu(emb)).unsqueeze(1)  # [B,1,6D]
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=-1)
+                x_msa = x * (1 + scale_msa) + shift_msa
+                return x_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+        self.adaln = AdaLayerNormZero(dim)
 
-        self.fuse_in = nn.Linear(dim, dim * 3 + int(dim * mlp_ratio))
-        self.fuse_out = nn.Linear(dim + int(dim * mlp_ratio), dim)
-        self.mlp_act = nn.GELU()
+        # Attention path
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj_attn = nn.Linear(dim, dim)
+        # Q/K norm parity with FramePack
+        if isinstance(qk_norm, str) and qk_norm.lower() in ("rms_norm", "rms"):
+            self.q_norm = RMSNorm(self.head_dim, eps=1e-6, affine=False)
+            self.k_norm = RMSNorm(self.head_dim, eps=1e-6, affine=False)
+        elif (isinstance(qk_norm, str) and qk_norm.lower() in ("layer_norm", "ln")) or (qk_norm is True):
+            self.q_norm = nn.LayerNorm(self.head_dim, elementwise_affine=False, eps=1e-6)
+            self.k_norm = nn.LayerNorm(self.head_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
 
-        self.q_norm = nn.LayerNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
-        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
-
-        # time modulation -> gate
-        self.mod = nn.Linear(dim, dim * 3)  # shift, scale, gate
+        # MLP path
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = MLP(dim, mlp_ratio=mlp_ratio)
 
     def forward(self, x, tvec, rope_freqs=None):
-        """
-        x: [B, L, D]
-        tvec: [B, D] time embedding projected to dim
-        rope_freqs: [L, 2*Dh] (Dh=head_dim) or None
-        """
         B, L, D = x.shape
-        h = self.pre(x)
-        shift, scale, gate = self.mod(tvec).chunk(3, dim=-1)
-        h = h * (1.0 + scale[:, None, :]) + shift[:, None, :]
 
-        fused = self.fuse_in(h)
-        qkv, mlp_in = torch.split(fused, [D*3, fused.shape[-1]-D*3], dim=-1)
+        # 1) AdaLN for attention
+        x_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln(x, tvec)
+
+        # 2) Attention
+        qkv = self.qkv(x_msa)
         q, k, v = qkv.chunk(3, dim=-1)
-
-        # [B, L, H, Dh] <-> [B, H, L, Dh]
-        def split_heads_blh(z):
-            return z.view(B, L, self.heads, self.head_dim)
-
-        def split_heads_bhl(z):
+        def to_bhl(z):
             return z.view(B, L, self.heads, self.head_dim).transpose(1, 2).contiguous()
-
-        v_bhl = split_heads_bhl(v)  # bf16 reference dtype
-        q_bhl = self.q_norm(split_heads_bhl(q))  # <- cast back to bf16
-        k_bhl = self.k_norm(split_heads_bhl(k))
-
-        # RoPE (expects [B,H,L,Dh])
+        q_bhl = self.q_norm(to_bhl(q))
+        k_bhl = self.k_norm(to_bhl(k))
+        v_bhl = to_bhl(v)
         if rope_freqs is not None:
             q_bhl, k_bhl = _apply_rope_qk(q_bhl, k_bhl, rope_freqs)
-
-        # Backend attention operates on [B, L, H, Dh]
+        # backend expects BLH
         q_blh = q_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
         k_blh = k_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
         v_blh = v_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
+        attn_blh = _attn_blh(q_blh, k_blh, v_blh)
+        attn = attn_blh.transpose(1, 2).reshape(B, L, D)
+        attn = self.proj_attn(attn)
 
-        attn_blh = _attn_blh(q_blh, k_blh, v_blh)  # [B,L,H,Dh]
-        attn = attn_blh.transpose(1, 2).reshape(B, L, D)  # -> [B,L,D]
+        h = x + gate_msa * attn  # residual 1
 
-        mlp = self.mlp_act(mlp_in)
-        out = self.fuse_out(torch.cat([attn, mlp], dim=-1))
-        return x + gate[:, None, :] * out
-
+        # 3) Post-attn LN -> modulate -> MLP -> gated residual
+        h2 = self.norm2(h)
+        h2 = h2 * (1 + scale_mlp) + shift_mlp
+        mlp_out = self.mlp(h2)
+        out = h + gate_mlp * mlp_out  # residual 2
+        return out
 
 # -----------------------------------------------------------------------------
 # Project tokens back to latent grid
@@ -303,6 +361,7 @@ class FinalProjector(nn.Module):
     def forward(self, x):  # x: [B, L, D]
         B, L, D = x.shape
         T, H, W = self.twh
+        x = x.to(self.proj.weight.dtype)
         y = self.proj(x)  # [B, L, out_ch * pt*ph*pw]
         y = y.view(B, T, H, W, self.out_ch, self.pt, self.ph, self.pw)  # block grid
         y = y.permute(0,4,1,5,2,6,3,7)  # [B,C,T,pt,H,ph,W,pw]
@@ -312,6 +371,7 @@ class FinalProjector(nn.Module):
 
 # -----------------------------------------------------------------------------
 # Main transformer (unchanged API; now with RoPE + backend-priority attention)
+# + TeaCache support
 # -----------------------------------------------------------------------------
 class LatentFlowMatchTransformer(nn.Module):
     """
@@ -331,6 +391,8 @@ class LatentFlowMatchTransformer(nn.Module):
         use_rope: bool = True,
         rope_theta: float = 256.0,
         rope_axes_dim: Optional[Tuple[int,int,int]] = None,  # (DT, DY, DX); if None -> split evenly from head_dim
+        # --- Parity knobs ---
+        qk_norm: str = "rms_norm",
     ):
         super().__init__()
         self.latent_channels = latent_channels
@@ -367,12 +429,81 @@ class LatentFlowMatchTransformer(nn.Module):
         self.patch = PatchEmbed3D(latent_channels, hidden_size, patch_size=patch_size)
 
         self.blocks = nn.ModuleList([
-            SingleStreamBlock(hidden_size, heads=heads, mlp_ratio=mlp_ratio, qk_norm=True)
+            SingleStreamBlock(hidden_size, heads=heads, mlp_ratio=mlp_ratio, qk_norm=qk_norm)
             for _ in range(depth)
         ])
         # Final projection (velocity)
-        self.final = None  # created at runtime after we know token grid
+        self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(4, 20, 20))  # created at runtime after we know token grid
 
+        # ---------------- TeaCache state ----------------
+        self._tc_enabled = False
+        self._tc_cnt = 0
+        self._tc_num_steps = 1
+        self._tc_rel_l1_thresh = 0.15
+        # default poly from a reference calibration; override via initialize_teacache(...)
+        self._tc_poly_coeffs = [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
+        self._tc_prev_mod_inp: Optional[torch.Tensor] = None
+        self._tc_prev_residual: Optional[torch.Tensor] = None
+        self._tc_accum: float = 0.0
+
+    # ---------------- TeaCache helpers ----------------
+    @torch.no_grad()
+    def initialize_teacache(self, enable_teacache: bool = True, num_steps: int = 25, rel_l1_thresh: float = 0.15, poly_coeffs: Optional[List[float]] = None):
+        """
+        Enable + configure TeaCache behavior. Call once before an inference trajectory.
+        - num_steps: total diffusion/flow steps in your sampler cycle
+        - rel_l1_thresh: larger => more skipping (faster, potentially lower quality)
+        - poly_coeffs: list of poly coeffs (np.polyfit order-4 recommended) mapping raw rel-L1
+                       of the first-block modulated input -> an accumulated "distance" unit.
+        """
+        self._tc_enabled = enable_teacache
+        self._tc_cnt = 0
+        self._tc_num_steps = int(max(1, num_steps))
+        self._tc_rel_l1_thresh = float(rel_l1_thresh)
+        if poly_coeffs is not None:
+            self._tc_poly_coeffs = list(map(float, poly_coeffs))
+        self._tc_prev_mod_inp = None
+        self._tc_prev_residual = None
+        self._tc_accum = 0.0
+
+    @torch.no_grad()
+    def _tc_poly(self, x: float) -> float:
+        # Horner's rule; coeffs are high->low order
+        c = self._tc_poly_coeffs
+        y = 0.0
+        for a in c:
+            y = y * x + a
+        return float(y)
+
+    @torch.no_grad()
+    def _tc_compute_modulated_input(self, tokens: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
+        b0 = self.blocks[0]
+        h, _gate = b0.adaln(tokens, tvec)
+        return h
+
+    @torch.no_grad()
+    def _tc_should_compute(self, curr_mod_inp: torch.Tensor) -> bool:
+        if self._tc_cnt == 0 or self._tc_cnt == self._tc_num_steps - 1 or self._tc_prev_mod_inp is None:
+            # always compute on the first and last steps
+            self._tc_accum = 0.0
+            return True
+        # relative L1 between successive modulated inputs
+        num = (curr_mod_inp - self._tc_prev_mod_inp).abs().mean().item()
+        den = (self._tc_prev_mod_inp.abs().mean().item() + 1e-12)
+        curr_rel_l1 = num / den
+        self._tc_accum += self._tc_poly(curr_rel_l1)
+        if self._tc_accum >= self._tc_rel_l1_thresh:
+            self._tc_accum = 0.0
+            return True
+        return False
+
+    @torch.no_grad()
+    def _tc_update_counters(self):
+        self._tc_cnt += 1
+        if self._tc_cnt == self._tc_num_steps:
+            self._tc_cnt = 0
+
+    # --------------------------------------------------
     def _rope_for_grid(self, Tg: int, Hg: int, Wg: int, device) -> Optional[torch.Tensor]:
         if not self.use_rope:
             return None
@@ -385,13 +516,32 @@ class LatentFlowMatchTransformer(nn.Module):
         """
         B, C, n, H, W = zt.shape
         x, (Tg, Hg, Wg) = self.patch(zt)  # [B, L, D]
-        if self.final is None:
-            self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(Tg, Hg, Wg)).to(zt.device)
 
-        rope_freqs = self._rope_for_grid(Tg, Hg, Wg, zt.device).to(x.dtype)  # [L, 2*Dh] or None
+        rope_freqs = self._rope_for_grid(Tg, Hg, Wg, zt.device)
+        rope_freqs = None if rope_freqs is None else rope_freqs.to(x.dtype)
 
         tvec = self.t_embed(t).to(x.dtype)  # [B,D]
-        for blk in self.blocks:
-            x = blk(x, tvec, rope_freqs=rope_freqs)
+
+        # ---------------- TeaCache path ----------------
+        if self._tc_enabled and len(self.blocks) > 0 and not self.training:
+            with torch.no_grad():
+                curr_mod_inp = self._tc_compute_modulated_input(x, tvec)
+                should_calc = self._tc_should_compute(curr_mod_inp)
+                self._tc_prev_mod_inp = curr_mod_inp
+                self._tc_update_counters()
+
+            if not should_calc and (self._tc_prev_residual is not None):
+                # reuse previous residual
+                x = x + self._tc_prev_residual
+            else:
+                ori_x = x
+                for blk in self.blocks:
+                    x = blk(x, tvec, rope_freqs=rope_freqs)
+                self._tc_prev_residual = x - ori_x
+        else:
+            for blk in self.blocks:
+                x = blk(x, tvec, rope_freqs=rope_freqs)
+
         vel = self.final(x)  # [B,Cz,n,H,W]
         return vel
+        

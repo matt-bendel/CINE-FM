@@ -52,7 +52,6 @@ def compute_strides_and_N(data_shape, patch_size=(80, 80, 7), extra_patch_num=(0
     N = torch.prod(torch.tensor(n_patches_list))
     return tuple(strides), N.item(), tuple(n_patches_list)
 
-# ---- NEW: overlap% → stride utility (spatial only; temporal fixed to 1-frame overlap) ----
 def _pct_to_stride(patch_len: int, overlap_pct: float) -> int:
     """
     Convert overlap percentage to stride length for one axis.

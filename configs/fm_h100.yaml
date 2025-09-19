@@ -1,15 +1,15 @@
 train_dataset:
   name: CINEFlowMatchLatentDataset
   args:
-    root: /storage/CINE_data/latents   # NEW: where precompute wrote latents
+    root: /users/PAS2812/mattbendel/CINE_data/latents   # NEW: where precompute wrote latents
     split: train
     num_time_samples: 1               # same sampling semantics as before
-    patch_batch: 8
+    patch_batch: 4
 
 val_dataset:
   name: CINEFlowMatchDataset           # unchanged raw-val path (uses VAE at val)
   args:
-    root: /storage/CINE_data
+    root: /users/PAS2812/mattbendel/CINE_data
     split: val
     normalize: qmag
 
@@ -31,7 +31,7 @@ vae:
     dim_mult: [1, 2] # [1, 2, 4] for 4x spatial downsampling, [1, 2] for 2x spatial downsampling
     num_res_blocks: 4
     attn_scales: []
-  load_state_dict_from: '/storage/matt_models/cardiac_vae/videos/step_0195000/state.pt'
+  load_state_dict_from: '/users/PAS2812/mattbendel/cardiac_vae/videos/step_0195000/state.pt'
   strict_load: false
   resume: false
 
@@ -46,9 +46,6 @@ model:
     heads: 24
     mlp_ratio: 4.0
     patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
-  load_state_dict_from: none
-  strict_load: false
-  resume: false
 
 optim:
   lr: 0.0002
@@ -71,10 +68,10 @@ sampler:
 logging:
   project: cardiac-lfm             # NEW
   run_name: wan_fm_videos          # NEW
-  log_every_steps: 100
-  val_every_steps: 20000
-  save_every_steps: 20000
-  out_dir: /storage/matt_models/latent_fm
-  wandb_dir: /storage/matt_models/wandb   # NEW (optional)
-  wandb_cache_dir: /storage/matt_models/wandbcache  # NEW (optional)
+  log_every_steps: 50
+  val_every_steps: 10000
+  save_every_steps: 10000
+  out_dir: /users/PAS2812/mattbendel/latent_fm
+  wandb_dir: /users/PAS2812/mattbendel/wandb   # NEW (optional)
+  wandb_cache_dir: /users/PAS2812/mattbendel/wandbcache  # NEW (optional)
 
