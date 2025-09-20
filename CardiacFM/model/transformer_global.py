@@ -349,23 +349,30 @@ class SingleStreamBlock(nn.Module):
 # Project tokens back to latent grid
 # -----------------------------------------------------------------------------
 class FinalProjector(nn.Module):
-    """Project tokens back to latent video (velocity) via 3D 'unpatchify'."""
-    def __init__(self, dim, out_ch, patch_size=(1,1,1), twh: Tuple[int,int,int]=(1,1,1)):
+    """
+    Project tokens back to latent grid (velocity) with **dynamic** T/H/W.
+    No grid is stored in the module; we pass (Tg,Hg,Wg) at forward.
+    """
+    def __init__(self, dim: int, out_ch: int, patch_size=(1, 1, 1)):
         super().__init__()
         self.dim = dim
-        self.out_ch = out_ch
-        self.pt, self.ph, self.pw = patch_size
-        self.twh = twh  # (T',H',W') token grid
-        self.proj = nn.Linear(dim, out_ch * self.pt * self.ph * self.pw)
+        self.out_ch = int(out_ch)
+        self.pt, self.ph, self.pw = map(int, patch_size)
+        self.proj = nn.Linear(dim, self.out_ch * self.pt * self.ph * self.pw)
 
-    def forward(self, x):  # x: [B, L, D]
+    def forward(self, x: torch.Tensor, twh: Tuple[int, int, int]) -> torch.Tensor:
+        """
+        x  : [B, L, D]  where L = Tg*Hg*Wg
+        twh: (Tg, Hg, Wg) token-grid from PatchEmbed3D
+        return: [B, C, T, H, W] in latent space (velocity)
+        """
         B, L, D = x.shape
-        T, H, W = self.twh
-        x = x.to(self.proj.weight.dtype)
-        y = self.proj(x)  # [B, L, out_ch * pt*ph*pw]
-        y = y.view(B, T, H, W, self.out_ch, self.pt, self.ph, self.pw)  # block grid
-        y = y.permute(0,4,1,5,2,6,3,7)  # [B,C,T,pt,H,ph,W,pw]
-        y = y.reshape(B, self.out_ch, T*self.pt, H*self.ph, W*self.pw)  # [B,C,T,H,W]
+        Tg, Hg, Wg = map(int, twh)
+
+        y = self.proj(x)  # [B, L, C*pt*ph*pw]
+        y = y.view(B, Tg, Hg, Wg, self.out_ch, self.pt, self.ph, self.pw)  # block grid
+        y = y.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()  # [B,C,Tg,pt,Hg,ph,Wg,pw]
+        y = y.view(B, self.out_ch, Tg * self.pt, Hg * self.ph, Wg * self.pw)
         return y
 
 
@@ -432,8 +439,8 @@ class LatentFlowMatchTransformer(nn.Module):
             SingleStreamBlock(hidden_size, heads=heads, mlp_ratio=mlp_ratio, qk_norm=qk_norm)
             for _ in range(depth)
         ])
-        # Final projection (velocity)
-        self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(4, 20, 20))  # created at runtime after we know token grid
+        # Final projection is now shape-agnostic; no twh baked in.
+        self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size)
 
         # ---------------- TeaCache state ----------------
         self._tc_enabled = False
@@ -511,27 +518,31 @@ class LatentFlowMatchTransformer(nn.Module):
 
     def forward(self, zt: torch.Tensor, t: torch.Tensor):
         """
-        zt: [B, Cz, n, H, W]
+        zt: [B, Cz, T, H, W]  (GLOBAL latent video; e.g., T=4 from 7→4 VAE)
         t : [B] in (0,1]
         """
-        B, C, P, n, H, W = zt.shape
-        x, (Tg, Hg, Wg) = self.patch(zt)  # [B, L, D]
+        assert zt.dim() == 5, f"Expected [B,Cz,T,H,W], got {tuple(zt.shape)}"
+        B, C, T, H, W = zt.shape
 
+        # 3D patch embed (often patch_size=(1,1,1) for global)
+        x, (Tg, Hg, Wg) = self.patch(zt)                     # x:[B, L, D], L=Tg*Hg*Wg
+
+        # RoPE for this grid at runtime (dynamic H/W friendly)
         rope_freqs = self._rope_for_grid(Tg, Hg, Wg, zt.device)
         rope_freqs = None if rope_freqs is None else rope_freqs.to(x.dtype)
 
-        tvec = self.t_embed(t).to(x.dtype)  # [B,D]
+        # time embedding
+        tvec = self.t_embed(t).to(x.dtype)                   # [B,D]
 
-        # ---------------- TeaCache path ----------------
+        # blocks (TeaCache path preserved)
         if self._tc_enabled and len(self.blocks) > 0 and not self.training:
             with torch.no_grad():
                 curr_mod_inp = self._tc_compute_modulated_input(x, tvec)
-                should_calc = self._tc_should_compute(curr_mod_inp)
+                should_calc  = self._tc_should_compute(curr_mod_inp)
                 self._tc_prev_mod_inp = curr_mod_inp
                 self._tc_update_counters()
 
             if not should_calc and (self._tc_prev_residual is not None):
-                # reuse previous residual
                 x = x + self._tc_prev_residual
             else:
                 ori_x = x
@@ -542,6 +553,8 @@ class LatentFlowMatchTransformer(nn.Module):
             for blk in self.blocks:
                 x = blk(x, tvec, rope_freqs=rope_freqs)
 
-        vel = self.final(x)  # [B,Cz,n,H,W]
+        # project back using the **runtime** token grid (Tg,Hg,Wg)
+        vel = self.final(x, (Tg, Hg, Wg))                    # [B,Cz,T,H,W]
         return vel
+
         
