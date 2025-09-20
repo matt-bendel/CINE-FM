@@ -62,7 +62,7 @@ class CINEFlowMatchLatentDataset(Dataset):
             f = self._open(ds)
             z = torch.from_numpy(f[name]["z"][()])
             num_patches = z.shape[2]
-            patch_dim_mid = num_patches // 2
-            z = z[:, :, patch_dim_mid - self.patch_batch // 2:patch_dim_mid + self.patch_batch // 2, :, :]
+            # patch_dim_mid = num_patches // 2
+            # z = z[:, :, patch_dim_mid - self.patch_batch // 2:patch_dim_mid + self.patch_batch // 2, :, :]
             clips.append(z)
         return clips  # ragged collate keeps lists per item
