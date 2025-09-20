@@ -47,6 +47,9 @@ if not (_HAS_FA3 or _HAS_FA2):
     except Exception:
         _HAS_SAGE2 = False
 
+print('HAS_FA3', _HAS_FA3)
+print('HAS_FA2', _HAS_FA2)
+print('HAS_SAGE2', _HAS_SAGE2)
 
 def _attn_blh(q_blh, k_blh, v_blh):
     """
