@@ -216,7 +216,7 @@ def main():
     ap.add_argument("--prefer_t_stride", type=int, default=6, help="T-1 → 1-frame overlap")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--batch_chunks", type=int, default=64)
-    ap.add_argument("--overlap", type=float, default=0.1,
+    ap.add_argument("--overlap", type=float, default=0.05,
                     help="Spatial overlap fraction in [0,1). If set and stride_h/w==0: stride = patch*(1-overlap).")
     args = ap.parse_args()
 
