@@ -37,7 +37,7 @@ vae:
 
 # FM transformer
 model:
-  import_path: CardiacFM.model.transformer
+  import_path: CardiacFM.model.transformer_global
   class_name: LatentFlowMatchTransformer
   args:
     latent_channels: 16
@@ -46,6 +46,9 @@ model:
     heads: 24
     mlp_ratio: 4.0
     patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
+  load_state_dict_from: none
+  strict_load: false
+  resume: false
 
 optim:
   lr: 0.0002
@@ -68,9 +71,9 @@ sampler:
 logging:
   project: cardiac-lfm             # NEW
   run_name: wan_fm_videos          # NEW
-  log_every_steps: 50
-  val_every_steps: 10000
-  save_every_steps: 10000
+  log_every_steps: 100
+  val_every_steps: 20000
+  save_every_steps: 20000
   out_dir: /users/PAS2812/mattbendel/latent_fm
   wandb_dir: /users/PAS2812/mattbendel/wandb   # NEW (optional)
   wandb_cache_dir: /users/PAS2812/mattbendel/wandbcache  # NEW (optional)
