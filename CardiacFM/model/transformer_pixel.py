@@ -19,14 +19,15 @@ _fa_func = None
 _sage_attn = None
 
 # Detect FA3 by its varlen symbol; still use flash_attn_func (dense) at runtime.
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as _fa3_varlen  # noqa: F401
-    from flash_attn import flash_attn_func as _fa_func
-    _fa_func  # silence linter if import succeeded
-    _fa_func_available = True
-    _HAS_FA3 = True
-except Exception:
-    _fa_func_available = False
+# if not _HAS
+# try:
+#     from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as _fa3_varlen  # noqa: F401
+#     from flash_attn import flash_attn_func as _fa_func
+#     _fa_func  # silence linter if import succeeded
+#     _fa_func_available = True
+#     _HAS_FA3 = True
+# except Exception:
+#     _fa_func_available = False
 
 # If FA3 isn't present, try FA2 (still exposes flash_attn_func)
 if not _HAS_FA3:
@@ -210,30 +211,23 @@ class HunyuanVideoRotaryPosEmbed(nn.Module):
         freqs = freqs.flatten(1).transpose(0, 1)  # [L, 2*Dh]
         return freqs
 
-
-def _apply_rope_qk(q: torch.Tensor, k: torch.Tensor, rope_freqs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    q,k: [B, H, L, Dh]
-    rope_freqs: [L, 2*Dh]  (first Dh are cos, last Dh are sin)
-    """
-    B, H, L, Dh = q.shape
-    assert rope_freqs.shape[0] == L, f"RoPE length mismatch: {rope_freqs.shape[0]} vs {L}"
-    assert rope_freqs.shape[1] == 2 * Dh, f"RoPE dim mismatch: {rope_freqs.shape[1]} vs {2*Dh}"
-    cos, sin = rope_freqs.chunk(2, dim=-1)  # [L,Dh]
-    cos = cos.view(1, 1, L, Dh)
-    sin = sin.view(1, 1, L, Dh)
+def _apply_rope_qk(q, k, rope_freqs):
+    # q,k: [B,H,L,Dh], rope_freqs: [L, 2*Dh] (fp32)
+    B,H,L,Dh = q.shape
+    cos, sin = rope_freqs.chunk(2, dim=-1)            # [L,Dh], fp32
+    cos = cos.view(1,1,L,Dh)
+    sin = sin.view(1,1,L,Dh)
 
     def _rotate(x):
-        x_ = x.unflatten(-1, (-1, 2))
+        x_ = x.float().unflatten(-1, (-1,2))
         x1, x2 = x_.unbind(-1)
         xr = torch.stack((-x2, x1), dim=-1).flatten(-2)
         return xr
 
-    q_rot = _rotate(q)
-    k_rot = _rotate(k)
-    q = (q * cos) + (q_rot * sin)
-    k = (k * cos) + (k_rot * sin)
-    return q, k
+    qf = q.float(); kf = k.float()
+    q_out = (qf * cos) + (_rotate(qf) * sin)
+    k_out = (kf * cos) + (_rotate(kf) * sin)
+    return q_out.to(q.dtype), k_out.to(k.dtype)
 
 
 # -----------------------------------------------------------------------------
@@ -326,8 +320,7 @@ class SingleStreamBlock(nn.Module):
         q_bhl = self.q_norm(to_bhl(q))
         k_bhl = self.k_norm(to_bhl(k))
         v_bhl = to_bhl(v)
-        if rope_freqs is not None:
-            q_bhl, k_bhl = _apply_rope_qk(q_bhl, k_bhl, rope_freqs)
+        q_bhl, k_bhl = _apply_rope_qk(q_bhl, k_bhl, rope_freqs)
         # backend expects BLH
         q_blh = q_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
         k_blh = k_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
@@ -390,7 +383,7 @@ class FlowMatchTransformer(nn.Module):
         # --- RoPE params ---
         use_rope: bool = True,
         rope_theta: float = 256.0,
-        rope_axes_dim: Optional[Tuple[int,int,int]] = None,  # (DT, DY, DX); if None -> split evenly from head_dim
+        rope_axes_dim: Optional[Tuple[int,int,int]] = (8, 32, 32),  # (DT, DY, DX); if None -> split evenly from head_dim
         # --- Parity knobs ---
         qk_norm: str = "rms_norm",
     ):
@@ -422,8 +415,7 @@ class FlowMatchTransformer(nn.Module):
             assert (dt + dy + dx) == self.head_dim, f"sum(rope_axes_dim) must equal head_dim ({self.head_dim})"
             assert dt % 2 == 0 and dy % 2 == 0 and dx % 2 == 0, "each rope_axes_dim must be even"
 
-        self.use_rope = bool(use_rope)
-        self.rope = HunyuanVideoRotaryPosEmbed(rope_axes_dim, theta=rope_theta) if self.use_rope else None
+        self.rope = HunyuanVideoRotaryPosEmbed(rope_axes_dim, theta=rope_theta)
 
         self.t_embed = TimeEmbed(hidden_size)
         self.patch = PatchEmbed3D(latent_channels, hidden_size, patch_size=patch_size)
@@ -505,8 +497,6 @@ class FlowMatchTransformer(nn.Module):
 
     # --------------------------------------------------
     def _rope_for_grid(self, Tg: int, Hg: int, Wg: int, device) -> Optional[torch.Tensor]:
-        if not self.use_rope:
-            return None
         return self.rope(Tg, Hg, Wg, device=device)  # [L, 2*Dh]
 
     def forward(self, zt: torch.Tensor, t: torch.Tensor):
@@ -518,7 +508,6 @@ class FlowMatchTransformer(nn.Module):
         x, (Tg, Hg, Wg) = self.patch(zt)  # [B, L, D]
 
         rope_freqs = self._rope_for_grid(Tg, Hg, Wg, zt.device)
-        rope_freqs = None if rope_freqs is None else rope_freqs.to(x.dtype)
 
         tvec = self.t_embed(t).to(x.dtype)  # [B,D]
 

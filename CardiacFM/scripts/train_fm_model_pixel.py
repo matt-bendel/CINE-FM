@@ -72,14 +72,15 @@ def try_import_dataset(name: str):
 
 
 # ==================== small viz helpers ====================
-def _frame_to_uint8(img_1hw: torch.Tensor) -> np.ndarray:
-    """
-    img_1hw is expected to already be in [-1, 1].
-    Map linearly to [0, 255] without per-frame stretching.
-    """
+def _frame_to_uint8(img_1hw: torch.Tensor, lo_p=0.01, hi_p=0.99) -> np.ndarray:
     f = torch.nan_to_num(img_1hw.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
-    g = ((f + 1.0) * 0.5).clamp_(0.0, 1.0) * 255.0
-    return g.round().to(torch.uint8).squeeze(0).numpy()
+    flat = f.flatten()
+    if flat.numel() == 0:
+        return np.zeros((f.shape[-2], f.shape[-1]), dtype=np.uint8)
+    lo = torch.quantile(flat, lo_p); hi = torch.quantile(flat, hi_p)
+    g = torch.zeros_like(f) if (hi - lo) < 1e-8 else (f - lo) / (hi - lo)
+    g = (g.clamp_(0, 1) * 255.0).round().to(torch.uint8).squeeze(0)
+    return g.numpy()
 
 # ==================== 2D spatial patchify (val) with overlap-add ====================
 
@@ -285,7 +286,8 @@ class PixelFMTrainer:
         device = X.device
         N = X.shape[0]
         noise  = torch.randn_like(X)               # bf16
-        t      = torch.rand((N,), device=device, dtype=torch.bfloat16)
+        # t      = (torch.rand((N,), device=device, dtype=torch.bfloat16) ** 2).clamp_(1e-4, 1.)
+        t = torch.rand((N,), device=device, dtype=torch.bfloat16)
         t_b    = t.view(N, *([1]*(X.ndim-1)))
         x_t    = (1.0 - t_b) * X + t_b * noise     # bf16
         target = (noise - X)                       # bf16
@@ -300,6 +302,8 @@ class PixelFMTrainer:
             print(f'data_max: {data_max:.4f}, data_min: {data_min:.4f}, pred_norm: {pred_norm:.4f}, target_norm: {target_norm:.4f}, t: {t[0]:.4f}')
 
         mse  = torch.nn.functional.mse_loss(pred.float(), target.float())
+        # mse = mse.mean(dim=(1,2,3,4))
+        # mse = (1 - t) * mse.mean()
         return {"total": mse, "mse": mse}
 
     def _fm_loss(self, X: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -399,9 +403,11 @@ class PixelFMTrainer:
                         scalars["lr"] = self.optimizer.param_groups[0]["lr"]
                         wandb.log(scalars, step=self.global_step)
 
-                    if (self.global_step % log_cfg["val_every_steps"] == 0):
+                    if (self.global_step % log_cfg["val_every_steps"] == 0) and self.global_step > 0:
                         if self.accelerator.is_main_process:
                             pbar.write(f"[val] step {self.global_step}")
+
+                        self.validate_fixed_t_x0_from_data((0.01, 0.10, 0.25, 0.50, 0.75, 1.00))
                         self.validate_uncond()
 
                         if self.global_step > 100000:
@@ -422,6 +428,119 @@ class PixelFMTrainer:
         if self.accelerator.is_main_process:
             pbar.close()
             self.accelerator.print("Training complete.")
+
+    @torch.no_grad()
+    def validate_fixed_t_x0_from_data(self, t_values=(0.01, 0.10, 0.25, 0.50, 0.75, 1.00)):
+        """
+        Uses RAW weights. Take true pixel patches from the val set, build x_t,
+        predict u(x_t, t), compute x0_pred = x_t - t * u, and log a video per t.
+        """
+        self.model.eval()
+        device = self.accelerator.device
+
+        # --- geometry & how many patches to show ---
+        vcfg = self.cfg.get("validation", {})
+        N   = int(vcfg.get("num_uncond_videos", 8))  # how many patches in the grid
+        pt  = int(vcfg.get("patch_t", 8))
+        ph  = int(vcfg.get("patch_h", 64))
+        pw  = int(vcfg.get("patch_w", 64))
+
+        # -------- fetch one validation volume [2,T,H,W] --------
+        try:
+            val_it = iter(self.val_dl)
+            batch_list = next(val_it)
+        except StopIteration:
+            if self.accelerator.is_main_process:
+                print("[validate_fixed_t_x0_from_data] empty val loader")
+            self.model.train()
+            return
+
+        x_true = None
+        for item in batch_list:
+            x_true = item
+            break
+
+        x_true = x_true.to(device=device, dtype=torch.float32)
+        if x_true.dim() == 3:
+            x_true = x_true.unsqueeze(1)  # [2,1,H,W] -> [2,T,H,W]
+
+        _, T, H, W = x_true.shape
+
+        # -------- pick a deterministic clip (center) of length pt --------
+        if T >= pt:
+            t0 = (T - pt) // 2
+            x_clip = x_true[:, t0:t0 + pt]  # [2,pt,H,W]
+        else:
+            # wrap if the sequence is shorter than pt
+            reps = (pt + T - 1) // T
+            x_clip = x_true.repeat(1, reps, 1, 1)[:, :pt]  # [2,pt,H,W]
+
+        # -------- spatially patchify into ph×pw with stride = patch (no overlap) --------
+        sh, sw = ph, pw
+        coords = spatial_coords(H, W, ph, pw, sh, sw)
+        patches = spatial_patchify_video(x_clip, ph, pw, sh, sw, coords)  # [P,2,pt,ph,pw]
+        if patches.shape[0] > N:
+            patches = patches[:N]
+        B = int(patches.shape[0])
+        if B == 0:
+            if self.accelerator.is_main_process:
+                print("[validate_fixed_t_x0_from_data] no patches after patchify")
+            self.model.train()
+            return
+
+        # helper
+        def _append_dims(v: torch.Tensor, target_ndim: int) -> torch.Tensor:
+            return v[(...,) + (None,) * (target_ndim - v.ndim)]
+
+        raw_model = self.accelerator.unwrap_model(self.model)
+
+        # Reuse a single noise draw per t (fresh per t to avoid leakage across t)
+        for t_scalar in t_values:
+            # build x_t from *true* patches
+            noise = torch.randn_like(patches)                                  # [B,2,pt,ph,pw]
+            t_vec = torch.full((B,), float(t_scalar), device=device)           # [B]
+            t_b   = _append_dims(t_vec, patches.ndim)                           # [B,1,1,1,1]
+            x_t   = (1.0 - t_b) * patches + t_b * noise                         # [B,2,pt,ph,pw]
+
+            # predict velocity and recover x0
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                u = raw_model(x_t.to(torch.bfloat16),
+                            (t_vec * float(self.t_scale)).to(torch.bfloat16)).float()
+            x0_pred = x_t - _append_dims(t_vec, patches.ndim) * u               # [B,2,pt,ph,pw]
+
+            # ---- grid video of magnitudes of x0_pred ----
+            rows = int(vcfg.get("grid_rows", 2))
+            cols = int(vcfg.get("grid_cols", max(1, (B + rows - 1) // rows)))
+            Tvid = int(x0_pred.shape[2])
+
+            frames = []
+            for tt in range(Tvid):
+                row_tiles = []
+                for r in range(rows):
+                    col_tiles = []
+                    for c in range(cols):
+                        idx = r * cols + c
+                        if idx < B:
+                            patch = x0_pred[idx]  # [2,pt,ph,pw]
+                            mag = torch.sqrt(torch.clamp(patch[0, tt]**2 + patch[1, tt]**2, min=0.0))
+                        else:
+                            mag = torch.zeros_like(x0_pred[0, 0, tt])
+                        col_tiles.append(mag)
+                    row_tiles.append(torch.cat(col_tiles, dim=-1))
+                grid_img = torch.cat(row_tiles, dim=-2)                          # [rows*ph, cols*pw]
+                frames.append(_frame_to_uint8(grid_img.unsqueeze(0)))
+
+            arr = np.stack(frames, axis=0)                                       # [T,H,W]
+            arr = arr[:, None, :, :]
+            arr = np.repeat(arr, 3, axis=1)
+            vid = wandb.Video(arr, fps=int(self.cfg.get("logging", {}).get("latent_grid_fps", 7)),
+                            format="mp4")
+
+            if self.accelerator.is_main_process:
+                tag = f"val/x0_pred_from_data_t_{t_scalar:.2f}".replace(".", "p")
+                wandb.log({tag: vid}, step=self.global_step)
+
+        self.model.train()
 
     # -------- validation: unconditional pixel patches (no VAE) --------
     @torch.no_grad()

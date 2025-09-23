@@ -19,7 +19,7 @@ val_dataset:
     seed: 123
 
 dataloader:
-  train_batch_size: 2         # pixel batches (you can tune)
+  train_batch_size: 4         # pixel batches (you can tune)
   val_batch_size: 1
   num_workers: 8
   pin_memory: false
@@ -32,11 +32,12 @@ model:
   class_name: FlowMatchTransformer              # <-- pixel model class
   args:
     latent_channels: 2
-    hidden_size: 1200
+    hidden_size: 864
     depth: 40
-    heads: 24
+    heads: 12
     mlp_ratio: 4.0
     patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
+    rope_axes_dim: [8, 32, 32]
   # load_state_dict_from: /storage/matt_models/latent_fm/flowmatch_pixels/step_0020000/state.pt
   load_state_dict_from: none
   strict_load: false
@@ -49,7 +50,7 @@ optim:
   grad_clip: 1.0
   total_steps: 500000
   ema_decay: 0.999
-  accum_steps: 2
+  accum_steps: 1
   scheduler:
     type: cosine
     eta_min_ratio: 0.1
@@ -70,7 +71,7 @@ logging:
   project: cardiac-lfm
   run_name: fm_pixels_64x64x8
   log_every_steps: 100
-  val_every_steps: 20000
+  val_every_steps: 1000
   save_every_steps: 20000
   out_dir: /storage/matt_models/latent_fm
   wandb_dir: /storage/matt_models/wandb

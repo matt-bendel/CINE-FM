@@ -26,8 +26,8 @@ class CINEPixelDataset(torch.utils.data.Dataset):
         fixed_train_L: Optional[int] = 8,
         t_choices: Optional[List[int]] = None,   # used only if fixed_train_L is None
         # spatial crop config (train only)
-        crop_h: int = 64,
-        crop_w: int = 64,
+        crop_h: int = 80,
+        crop_w: int = 80,
         # normalization
         normalize: str = "qmag",           # "qmag" or "none"
         norm_q: float = 0.995,
