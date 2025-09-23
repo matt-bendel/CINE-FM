@@ -19,24 +19,23 @@ _fa_func = None
 _sage_attn = None
 
 # Detect FA3 by its varlen symbol; still use flash_attn_func (dense) at runtime.
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as _fa3_varlen  # noqa: F401
-    from flash_attn import flash_attn_func as _fa_func
-    _fa_func  # silence linter if import succeeded
-    _fa_func_available = True
-    _HAS_FA3 = True
-except Exception:
-    _fa_func_available = False
+# try:
+#     from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as _fa3_varlen  # noqa: F401
+#     from flash_attn import flash_attn_func as _fa_func
+#     _fa_func  # silence linter if import succeeded
+#     _fa_func_available = True
+#     _HAS_FA3 = True
+# except Exception:
+#     _fa_func_available = False
 
 # If FA3 isn't present, try FA2 (still exposes flash_attn_func)
-if not _HAS_FA3:
-    try:
-        from flash_attn import flash_attn_func as _fa_func
-        _fa_func  # noqa: F401
-        _fa_func_available = True
-        _HAS_FA2 = True
-    except Exception:
-        _fa_func_available = False
+try:
+    from flash_attn import flash_attn_func as _fa_func
+    _fa_func  # noqa: F401
+    _fa_func_available = True
+    _HAS_FA2 = True
+except Exception:
+    _fa_func_available = False
 
 # Sage-Attn v2
 if not (_HAS_FA3 or _HAS_FA2):

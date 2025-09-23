@@ -286,12 +286,13 @@ class PixelFMTrainer:
         device = X.device
         N = X.shape[0]
         noise  = torch.randn_like(X)               # bf16
-        # t      = (torch.rand((N,), device=device, dtype=torch.bfloat16) ** 2).clamp_(1e-4, 1.)
-        t = torch.rand((N,), device=device, dtype=torch.bfloat16)
-        t_b    = t.view(N, *([1]*(X.ndim-1)))
+        sigmas = torch.rand((N,), device=device, dtype=torch.bfloat16)
+
+        t_b    = sigmas.view(N, *([1]*(X.ndim-1)))
         x_t    = (1.0 - t_b) * X + t_b * noise     # bf16
         target = (noise - X)                       # bf16
-        t_inp  = (t * self.t_scale)                # bf16
+
+        t_inp  = (sigmas * self.t_scale)                # bf16
 
         pred = self.model(x_t, t_inp)              # bf16 velocity
         if self.accelerator.is_main_process:
@@ -299,11 +300,9 @@ class PixelFMTrainer:
             data_min = X.min()
             pred_norm = pred[0].norm()
             target_norm = target[0].norm()
-            print(f'data_max: {data_max:.4f}, data_min: {data_min:.4f}, pred_norm: {pred_norm:.4f}, target_norm: {target_norm:.4f}, t: {t[0]:.4f}')
+            print(f't_scale: {self.t_scale}, data_max: {data_max:.4f}, data_min: {data_min:.4f}, pred_norm: {pred_norm:.4f}, target_norm: {target_norm:.4f}, t: {sigmas[0]:.4f}')
 
         mse  = torch.nn.functional.mse_loss(pred.float(), target.float())
-        # mse = mse.mean(dim=(1,2,3,4))
-        # mse = (1 - t) * mse.mean()
         return {"total": mse, "mse": mse}
 
     def _fm_loss(self, X: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -317,32 +316,13 @@ class PixelFMTrainer:
         """
         device = self.accelerator.device
 
-        # group clips by shape to avoid ragged stack issues
-        buckets: Dict[Tuple[int,int,int,int], List[torch.Tensor]] = {}
-        for item in batch_list:
-            x = item.to(device=device, dtype=torch.bfloat16)  # [2,L,H,W]
-            key = (int(x.shape[0]), int(x.shape[1]), int(x.shape[2]), int(x.shape[3]))
-            buckets.setdefault(key, []).append(x)
+        X = torch.stack(batch_list, dim=0)  # [B,2,L,H,W]
+        losses = self._fm_loss(X)
+        l = losses["total"]
+        m = losses["mse"]
 
-        if not buckets:
-            z = torch.zeros((), device=device, dtype=torch.float32)
-            return {"total": z, "mse": z}
-
-        total_loss = None
-        total_mse  = None
-        n_groups = 0
-
-        for key, group in buckets.items():
-            X = torch.stack(group, dim=0)  # [B,2,L,H,W]
-            losses = self._fm_loss(X)
-            l = losses["total"]
-            m = losses["mse"]
-            total_loss = l if (total_loss is None) else (total_loss + l)
-            total_mse  = m if (total_mse  is None) else (total_mse  + m)
-            n_groups += 1
-
-        total_loss = total_loss / n_groups
-        total_mse  = total_mse  / n_groups
+        total_loss = l
+        total_mse  = m
         return {"total": total_loss, "mse": total_mse}
 
     # -------- training loop --------
@@ -430,20 +410,22 @@ class PixelFMTrainer:
             self.accelerator.print("Training complete.")
 
     @torch.no_grad()
-    def validate_fixed_t_x0_from_data(self, t_values=(0.01, 0.10, 0.25, 0.50, 0.75, 1.00)):
+    def validate_fixed_t_x0_from_data(self, t_values=(0.01, 0.10, 0.25, 0.50, 0.75, 0.999)):
         """
-        Uses RAW weights. Take true pixel patches from the val set, build x_t,
+        RAW weights. Take true pixel patches from the val set, build x_t,
         predict u(x_t, t), compute x0_pred = x_t - t * u, and log a video per t.
+        Also:
+        • 'oracle' check with u* = x1 - x0 to verify math/broadcasting
+        • compare 'scaled t' (×t_scale) vs 'unscaled' t to detect t-scale bugs
         """
         self.model.eval()
         device = self.accelerator.device
 
-        # --- geometry & how many patches to show ---
-        vcfg = self.cfg.get("validation", {})
-        N   = int(vcfg.get("num_uncond_videos", 8))  # how many patches in the grid
-        pt  = int(vcfg.get("patch_t", 8))
-        ph  = int(vcfg.get("patch_h", 64))
-        pw  = int(vcfg.get("patch_w", 64))
+        # --- use the SAME val patch geometry you set in __init__ ---
+        pt = int(self.val_patch_t)
+        ph = int(self.val_patch_h)
+        pw = int(self.val_patch_w)
+        N  = int(self.cfg.get("validation", {}).get("num_uncond_videos", 8))
 
         # -------- fetch one validation volume [2,T,H,W] --------
         try:
@@ -463,19 +445,17 @@ class PixelFMTrainer:
         x_true = x_true.to(device=device, dtype=torch.float32)
         if x_true.dim() == 3:
             x_true = x_true.unsqueeze(1)  # [2,1,H,W] -> [2,T,H,W]
-
         _, T, H, W = x_true.shape
 
-        # -------- pick a deterministic clip (center) of length pt --------
+        # -------- deterministic center clip of length pt (wrap if needed) --------
         if T >= pt:
             t0 = (T - pt) // 2
             x_clip = x_true[:, t0:t0 + pt]  # [2,pt,H,W]
         else:
-            # wrap if the sequence is shorter than pt
             reps = (pt + T - 1) // T
             x_clip = x_true.repeat(1, reps, 1, 1)[:, :pt]  # [2,pt,H,W]
 
-        # -------- spatially patchify into ph×pw with stride = patch (no overlap) --------
+        # -------- spatial patches, stride == patch (no overlap) --------
         sh, sw = ph, pw
         coords = spatial_coords(H, W, ph, pw, sh, sw)
         patches = spatial_patchify_video(x_clip, ph, pw, sh, sw, coords)  # [P,2,pt,ph,pw]
@@ -488,30 +468,54 @@ class PixelFMTrainer:
             self.model.train()
             return
 
-        # helper
         def _append_dims(v: torch.Tensor, target_ndim: int) -> torch.Tensor:
             return v[(...,) + (None,) * (target_ndim - v.ndim)]
 
         raw_model = self.accelerator.unwrap_model(self.model)
 
-        # Reuse a single noise draw per t (fresh per t to avoid leakage across t)
-        for t_scalar in t_values:
-            # build x_t from *true* patches
-            noise = torch.randn_like(patches)                                  # [B,2,pt,ph,pw]
-            t_vec = torch.full((B,), float(t_scalar), device=device)           # [B]
-            t_b   = _append_dims(t_vec, patches.ndim)                           # [B,1,1,1,1]
-            x_t   = (1.0 - t_b) * patches + t_b * noise                         # [B,2,pt,ph,pw]
-
-            # predict velocity and recover x0
+        # one helper to run the net and make x0
+        def _predict_x0(x_t: torch.Tensor, t_scalar: float, scaled: bool) -> torch.Tensor:
+            t = torch.full((B,), float(t_scalar), device=device, dtype=torch.float32)
+            t_inp = (t * float(self.t_scale)) if scaled else t
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                u = raw_model(x_t.to(torch.bfloat16),
-                            (t_vec * float(self.t_scale)).to(torch.bfloat16)).float()
-            x0_pred = x_t - _append_dims(t_vec, patches.ndim) * u               # [B,2,pt,ph,pw]
+                u = raw_model(x_t.to(torch.bfloat16), t_inp.to(torch.bfloat16)).float()
+            return x_t - _append_dims(t, x_t.ndim) * u  # [B,2,pt,ph,pw]
 
-            # ---- grid video of magnitudes of x0_pred ----
-            rows = int(vcfg.get("grid_rows", 2))
-            cols = int(vcfg.get("grid_cols", max(1, (B + rows - 1) // rows)))
-            Tvid = int(x0_pred.shape[2])
+        # Reuse a single noise draw per t
+        for t_scalar in t_values:
+            # 1) build x_t and the oracle u*
+            noise = torch.randn_like(patches)                                   # [B,2,pt,ph,pw]
+            t_vec = torch.full((B,), float(t_scalar), device=device, dtype=torch.float32)
+            t_b   = _append_dims(t_vec, patches.ndim)
+
+            x0_true = patches.float()                                           # [B,2,pt,ph,pw]
+            x_t     = (1.0 - t_b) * x0_true + t_b * noise                      # [B,2,pt,ph,pw]
+            u_star  = (noise - x0_true)                                         # [B,2,pt,ph,pw]
+            x0_orac = x_t - t_b * u_star                                        # should equal x0_true
+
+            # 2) run model with (a) scaled t, (b) unscaled t (t-scale sanity check)
+            x0_pred_scaled   = _predict_x0(x_t, t_scalar, scaled=True)
+            x0_pred_unscaled = _predict_x0(x_t, t_scalar, scaled=False)
+
+            # 3) metrics
+            mse_scaled   = torch.mean((x0_pred_scaled   - x0_true).float()**2).item()
+            mse_unscaled = torch.mean((x0_pred_unscaled - x0_true).float()**2).item()
+            mse_oracle   = torch.mean((x0_orac          - x0_true).float()**2).item()
+
+            if self.accelerator.is_main_process:
+                print(f"[fixed-t] t={t_scalar:.3f} | MSE scaled={mse_scaled:.6e}  unscaled={mse_unscaled:.6e}  oracle={mse_oracle:.3e}")
+                wandb.log({
+                    "val_fixed_t/mse_scaled": mse_scaled,
+                    "val_fixed_t/mse_unscaled": mse_unscaled,
+                    "val_fixed_t/mse_oracle": mse_oracle,
+                    "val_fixed_t/t": float(t_scalar),
+                }, step=self.global_step)
+
+            # 4) log a video for the *scaled* prediction (what you care about)
+            to_show = x0_pred_scaled  # [B,2,pt,ph,pw]
+            rows = int(self.cfg.get("validation", {}).get("grid_rows", 2))
+            cols = int(self.cfg.get("validation", {}).get("grid_cols", max(1, (B + rows - 1) // rows)))
+            Tvid = int(to_show.shape[2])
 
             frames = []
             for tt in range(Tvid):
@@ -521,10 +525,10 @@ class PixelFMTrainer:
                     for c in range(cols):
                         idx = r * cols + c
                         if idx < B:
-                            patch = x0_pred[idx]  # [2,pt,ph,pw]
+                            patch = to_show[idx]  # [2,pt,ph,pw]
                             mag = torch.sqrt(torch.clamp(patch[0, tt]**2 + patch[1, tt]**2, min=0.0))
                         else:
-                            mag = torch.zeros_like(x0_pred[0, 0, tt])
+                            mag = torch.zeros_like(to_show[0, 0, tt])
                         col_tiles.append(mag)
                     row_tiles.append(torch.cat(col_tiles, dim=-1))
                 grid_img = torch.cat(row_tiles, dim=-2)                          # [rows*ph, cols*pw]
@@ -533,11 +537,9 @@ class PixelFMTrainer:
             arr = np.stack(frames, axis=0)                                       # [T,H,W]
             arr = arr[:, None, :, :]
             arr = np.repeat(arr, 3, axis=1)
-            vid = wandb.Video(arr, fps=int(self.cfg.get("logging", {}).get("latent_grid_fps", 7)),
-                            format="mp4")
-
+            vid = wandb.Video(arr, fps=int(self.cfg.get("logging", {}).get("latent_grid_fps", 7)), format="mp4")
             if self.accelerator.is_main_process:
-                tag = f"val/x0_pred_from_data_t_{t_scalar:.2f}".replace(".", "p")
+                tag = f"val/x0_pred_from_data_t_{t_scalar:.3f}".replace(".", "p")
                 wandb.log({tag: vid}, step=self.global_step)
 
         self.model.train()

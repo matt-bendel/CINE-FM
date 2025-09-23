@@ -18,6 +18,76 @@ _HAS_SAGE2 = False
 _fa_func = None
 _sage_attn = None
 
+# -----------------------------------------------------------------------------
+# Attention backends (priority: FA3 dense > FA3 varlen > FA2 dense > SDPA)
+# -----------------------------------------------------------------------------
+import torch
+import torch.nn.functional as F
+
+_HAS_FA3_DENSE = False
+_HAS_FA3_VARLEN = False
+_HAS_FA2 = False
+
+_fa3_dense = None
+_fa3_varlen = None
+_fa3_varlen_qkvpacked = None
+_fa2_dense = None
+
+# FA3 dense
+# FA3 varlen (either separate or qkvpacked)
+if not _HAS_FA3_DENSE:
+    try:
+        from flash_attn_3.flash_attn_interface import flash_attn_varlen_func as _fa3_varlen
+        _HAS_FA3_VARLEN = True
+    except Exception:
+        try:
+            from flash_attn_3.flash_attn_interface import flash_attn_varlen_qkvpacked_func as _fa3_varlen_qkvpacked
+            _HAS_FA3_VARLEN = True
+        except Exception:
+            pass
+
+# FA2 dense (NOTE: correct path is flash_attn.flash_attn_interface)
+if not (_HAS_FA3_DENSE or _HAS_FA3_VARLEN):
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func as _fa2_dense
+        _HAS_FA2 = True
+    except Exception:
+        pass
+
+
+def _fa3_varlen_dense_wrapper(q_blh, k_blh, v_blh):
+    """
+    Use FA3 varlen kernels to service dense BLHD input.
+    q/k/v: [B, L, H, Dh] (bf16/fp16) -> returns same shape
+    """
+    B, L, H, Dh = q_blh.shape
+    device = q_blh.device
+    cu = torch.arange(0, (B + 1) * L, step=L, device=device, dtype=torch.int32)
+
+    if _fa3_varlen is not None:
+        q = q_blh.reshape(B * L, H, Dh)
+        k = k_blh.reshape(B * L, H, Dh)
+        v = v_blh.reshape(B * L, H, Dh)
+        o = _fa3_varlen(
+            q, k, v,
+            cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=L, max_seqlen_k=L,
+            dropout_p=0.0, softmax_scale=None, causal=False
+        )
+        return o.reshape(B, L, H, Dh)
+
+    # qkvpacked fallback
+    q = q_blh.reshape(B * L, H, Dh)
+    k = k_blh.reshape(B * L, H, Dh)
+    v = v_blh.reshape(B * L, H, Dh)
+    qkv = torch.stack([q, k, v], dim=1)  # [B*L, 3, H, Dh]
+    o = _fa3_varlen_qkvpacked(
+        qkv, cu_seqlens=cu, max_seqlen=L,
+        dropout_p=0.0, softmax_scale=None, causal=False
+    )
+    return o.reshape(B, L, H, Dh)
+
+
 # Detect FA3 by its varlen symbol; still use flash_attn_func (dense) at runtime.
 # if not _HAS
 # try:
@@ -30,58 +100,30 @@ _sage_attn = None
 #     _fa_func_available = False
 
 # If FA3 isn't present, try FA2 (still exposes flash_attn_func)
-if not _HAS_FA3:
-    try:
-        from flash_attn import flash_attn_func as _fa_func
-        _fa_func  # noqa: F401
-        _fa_func_available = True
-        _HAS_FA2 = True
-    except Exception:
-        _fa_func_available = False
-
-# Sage-Attn v2
-if not (_HAS_FA3 or _HAS_FA2):
-    try:
-        from sageattention import sageattn as _sage_attn
-        _sage_attn  # noqa: F401
-        _HAS_SAGE2 = True
-    except Exception:
-        _HAS_SAGE2 = False
-
 
 def _attn_blh(q_blh, k_blh, v_blh):
     """
-    Backend-chooser for attention.
     Inputs/Outputs are [B, L, H, Dh] (BLHD).
     """
-    # flash-attn v3 or v2
-    if _fa_func_available:
-        # flash_attn_func expects [B, L, H, Dh]
-        return _fa_func(q_blh, k_blh, v_blh, dropout_p=0.0, softmax_scale=None, causal=False)
+    # FA3 dense → FA3 varlen → FA2 → SDPA
+    if _HAS_FA3_DENSE:
+        return _fa3_dense(q_blh, k_blh, v_blh, dropout_p=0.0, softmax_scale=None, causal=False)
 
-    # sage-attn v2
-    if _HAS_SAGE2:
-        try:
-            # Common builds accept BLHD; fall back to another layout if needed.
-            return _sage_attn(q_blh, k_blh, v_blh, tensor_layout="BLHD")
-        except Exception:
-            # Last try – some wheels expect "NHD" (we map [B,L,H,D] -> [L*B,H,D]).
-            B, L, H, Dh = q_blh.shape
-            q_nhd = q_blh.reshape(B * L, H, Dh)
-            k_nhd = k_blh.reshape(B * L, H, Dh)
-            v_nhd = v_blh.reshape(B * L, H, Dh)
-            out_nhd = _sage_attn(q_nhd, k_nhd, v_nhd, tensor_layout="NHD")
-            return out_nhd.reshape(B, L, H, Dh)
+    if _HAS_FA3_VARLEN:
+        return _fa3_varlen_dense_wrapper(q_blh, k_blh, v_blh)
 
-    # PyTorch SDPA fallback
-    # Convert to [L, B*H, Dh] for scaled_dot_product_attention
+    if _HAS_FA2:
+        return _fa2_dense(q_blh, k_blh, v_blh, dropout_p=0.0, softmax_scale=None, causal=False)
+
+    # PyTorch SDPA (use CUDA flash/mem-efficient kernels when available)
     B, L, H, Dh = q_blh.shape
     q_lbh = q_blh.permute(1, 0, 2, 3).reshape(L, B * H, Dh)
     k_lbh = k_blh.permute(1, 0, 2, 3).reshape(L, B * H, Dh)
     v_lbh = v_blh.permute(1, 0, 2, 3).reshape(L, B * H, Dh)
-    out_lbh = F.scaled_dot_product_attention(q_lbh, k_lbh, v_lbh, dropout_p=0.0, is_causal=False)
+    # Prefer flash; fall back to mem-efficient; avoid math kernel on CUDA
+    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
+        out_lbh = F.scaled_dot_product_attention(q_lbh, k_lbh, v_lbh, dropout_p=0.0, is_causal=False)
     return out_lbh.reshape(L, B, H, Dh).permute(1, 0, 2, 3).contiguous()
-
 
 # -----------------------------------------------------------------------------
 # Time embedding (unchanged)

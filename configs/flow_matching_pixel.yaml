@@ -19,7 +19,7 @@ val_dataset:
     seed: 123
 
 dataloader:
-  train_batch_size: 4         # pixel batches (you can tune)
+  train_batch_size: 2         # pixel batches (you can tune)
   val_batch_size: 1
   num_workers: 8
   pin_memory: false
@@ -33,7 +33,7 @@ model:
   args:
     latent_channels: 2
     hidden_size: 864
-    depth: 40
+    depth: 30
     heads: 12
     mlp_ratio: 4.0
     patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
@@ -71,7 +71,7 @@ logging:
   project: cardiac-lfm
   run_name: fm_pixels_64x64x8
   log_every_steps: 100
-  val_every_steps: 1000
+  val_every_steps: 500
   save_every_steps: 20000
   out_dir: /storage/matt_models/latent_fm
   wandb_dir: /storage/matt_models/wandb

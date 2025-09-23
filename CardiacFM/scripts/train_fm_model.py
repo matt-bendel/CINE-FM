@@ -100,7 +100,7 @@ def try_import_dataset(name: str):
     VAL/TEST: CINEDataset (raw) – unchanged
     """
     if name == "CINEFlowMatchLatentDataset":
-        mod = importlib.import_module("data.cine_flow_dataset")
+        mod = importlib.import_module("data.cine_flow_dataset_new")
         return getattr(mod, "CINEFlowMatchLatentDataset")
     elif name in ("CINEDataset", "CINEFlowMatchDataset"):
         mod = importlib.import_module("data.cine_dataset")
@@ -365,24 +365,29 @@ class LatentFMTrainer:
         return self._rectified_flow_loss(Z)
 
     # -------- training step (latents only) --------
-    def compute_loss(self, batch_list: List[Any]) -> Dict[str, torch.Tensor]:
+    def compute_loss(self, batch) -> Dict[str, torch.Tensor]:
         """
-        TRAIN batches: list-of-items; each item is a *list* of z clips [Cz,7,P,H',W'].
-        Flatten P across items → [N, Cz, 7, H', W'] (bf16).
+        TRAIN batch: tensor [B, Cz, nt, H', W'] (bf16 under Accelerate autocast)
         """
         device = self.accelerator.device
-        z_batches = []
-        for item in batch_list:
-            if isinstance(item, list):
-                for z in item:
-                    z = z.to(device=device, dtype=torch.bfloat16)   # <<< ensure bf16 inputs
-                    z = z.permute(2, 0, 1, 3, 4).contiguous()       # [P,Cz,7,H',W']
-                    z_batches.append(z)
-        if not z_batches:
-            zero = torch.zeros((), device=device, dtype=torch.float32)
-            return {"total": zero, "mse": zero}
-        Z = torch.cat(z_batches, dim=0)  # [N,Cz,7,H',W'] bf16
-        return self._fm_loss(Z)
+        if isinstance(batch, list):
+            # If a custom dataloader slips a list in, stack it defensively.
+            batch = torch.stack(batch, dim=0)
+        Z = batch.to(device=device, dtype=torch.bfloat16)   # [B,Cz,nt,H',W']
+
+        # Rectified flow loss (same math as before, just no permutation/flattening)
+        N = Z.shape[0]
+        noise  = torch.randn_like(Z)                        # bf16
+        t_vec  = torch.rand((N,), device=device, dtype=torch.bfloat16)   # U(0,1)
+
+        t_b = t_vec.view(N, *([1] * (Z.dim() - 1)))        # [B,1,1,1,1]
+        x_t = (1.0 - t_b) * Z + t_b * noise                # bf16
+        target = (noise - Z)                                # bf16
+        t_inp = (t_vec * self.t_scale)                     # bf16
+
+        pred = self.model(x_t, t_inp)                      # bf16
+        mse = torch.nn.functional.mse_loss(pred.float(), target.float())
+        return {"total": mse, "mse": mse}
 
     # -------- training loop --------
     def train(self):
@@ -444,11 +449,13 @@ class LatentFMTrainer:
                         scalars["lr"] = self.optimizer.param_groups[0]["lr"]
                         wandb.log(scalars, step=self.global_step)
 
-                    if (self.global_step % log_cfg["val_every_steps"] == 0):# and self.global_step > 0:
+                    if (self.global_step % log_cfg["val_every_steps"] == 0) and self.global_step > 0:
                         if self.accelerator.is_main_process:
                             pbar.write(f"[val] step {self.global_step}")
                         # self.validate()
+                        self.validate_fixed_t_x0_from_data()
                         self.validation_simple()
+                        self.validation_simple(use_ema=True)
                         self.validation_simple_inv()
                         self.accelerator.wait_for_everyone()
 
@@ -615,6 +622,167 @@ class LatentFMTrainer:
         self.model.train()
 
     @torch.no_grad()
+    def validate_fixed_t_x0_from_data(self, t_values=(0.01, 0.10, 0.25, 0.50, 0.75, 1.00)):
+        """
+        Latent-space version of 'predict x0 from data':
+        • take one val video [2,T,H,W]
+        • center temporal clip of length pt, spatially patchify (no overlap)
+        • VAE-encode patches -> z_patches [B,Cz,nt,H',W']
+        • for each t: x_t = (1-t)z + t·ε ; u = net(x_t, t·t_scale); x0 = x_t - t·u
+        • decode x0 -> pixel patches; log a grid video of magnitudes per t
+        """
+        self.model.eval()
+        device = self.accelerator.device
+        vcfg   = self.cfg.get("validation", {})
+        pt     = int(vcfg.get("patch_t", 7))
+        ph     = int(vcfg.get("patch_h", 80))
+        pw     = int(vcfg.get("patch_w", 80))
+        Nshow  = int(vcfg.get("num_uncond_videos", 8))  # how many patches to visualize
+        bs     = int(vcfg.get("patch_batch", 64))       # VAE micro-batch
+
+        # -- grab one val sample deterministically
+        try:
+            it = iter(self.val_dl)
+            batch_list = next(it)
+            x_true = None
+            for item in batch_list:
+                x_true = item
+                break
+        except StopIteration:
+            if self.accelerator.is_main_process:
+                print("[validate_fixed_t_x0_from_data] empty val loader")
+            self.model.train()
+            return
+
+        x_true = x_true.to(device=device, dtype=torch.float32)   # [2,T,H,W] or [2,1,H,W]
+        if x_true.dim() == 3:
+            x_true = x_true.unsqueeze(1)
+        _, T, H, W = x_true.shape
+
+        # -- center temporal clip of length pt (wrap if needed)
+        if T >= pt:
+            t0 = (T - pt) // 2
+            x_clip = x_true[:, t0:t0 + pt]                       # [2,pt,H,W]
+        else:
+            reps = (pt + T - 1) // T
+            x_clip = x_true.repeat(1, reps, 1, 1)[:, :pt]        # [2,pt,H,W]
+
+        # -- spatial patchify (no overlap): stride = patch
+        sh, sw = ph, pw
+        def _spatial_coords(H: int, W: int, ph: int, pw: int, sh: int, sw: int):
+            n1 = max(1, math.ceil((H - ph) / sh) + 1)
+            n2 = max(1, math.ceil((W - pw) / sw) + 1)
+            coords = []
+            for j in range(n1):
+                y0 = j * sh; y1 = min(y0 + ph, H); s1 = y1 - y0
+                for k in range(n2):
+                    x0 = k * sw; x1 = min(x0 + pw, W); s2 = x1 - x0
+                    coords.append((y0, y1, s1, x0, x1, s2))
+            return coords, n1, n2
+
+        def _spatial_patchify_video(x_2thw: torch.Tensor, ph: int, pw: int, sh: int, sw: int, coords):
+            _, Tt, Hh, Ww = x_2thw.shape
+            out = torch.zeros((len(coords), 2, Tt, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
+            for idx, (y0,y1,s1,x0,x1,s2) in enumerate(coords):
+                patch = torch.zeros((2, Tt, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
+                patch[:, :, :s1, :s2] = x_2thw[:, :, y0:y1, x0:x1]
+                out[idx] = patch
+            return out
+
+        coords, n1, n2 = _spatial_coords(H, W, ph, pw, sh, sw)
+        patches_px = _spatial_patchify_video(x_clip, ph, pw, sh, sw, coords)   # [P,2,pt,ph,pw]
+        if patches_px.shape[0] > Nshow:
+            mid = patches_px.shape[0] // 2
+            patches_px = patches_px[mid - Nshow//2:mid + Nshow//2]
+        B = int(patches_px.shape[0])
+        if B == 0:
+            if self.accelerator.is_main_process:
+                print("[validate_fixed_t_x0_from_data] no patches after patchify")
+            self.model.train()
+            return
+
+        # -- encode pixel patches -> latent patches
+        def _encode_pixel_patches(patches_P2thw: torch.Tensor) -> torch.Tensor:
+            outs = []
+            for i in range(0, patches_P2thw.shape[0], bs):
+                chunk = patches_P2thw[i:i+bs]
+                x_list = [x for x in chunk]                      # list of [2,pt,ph,pw]
+                pairs = self.vae(x_list, op="encode")            # list of (mu, logv) or [mu]
+                for pr in pairs:
+                    mu = pr[0] if isinstance(pr, (list, tuple)) else pr
+                    if mu.dim() == 5 and mu.shape[0] == 1:
+                        mu = mu.squeeze(0)                       # [Cz,nt,H',W']
+                    outs.append(mu)
+            return torch.stack(outs, dim=0)                       # [B,Cz,nt,H',W']
+
+        def _decode_latent_patches(z_Pcnhw: torch.Tensor) -> torch.Tensor:
+            outs = []
+            for i in range(0, z_Pcnhw.shape[0], bs):
+                chunk = z_Pcnhw[i:i+bs]
+                z_list = [z.unsqueeze(0) for z in chunk]         # list [1,Cz,nt,H',W']
+                dec = self.vae(z_list, op="decode")              # list of [1,2,pt,ph,pw]
+                for o in dec:
+                    if isinstance(o, (list, tuple)):
+                        o = o[0]
+                    outs.append(o.squeeze(0))                    # [2,pt,ph,pw]
+            return torch.stack(outs, dim=0)                      # [B,2,pt,ph,pw]
+
+        z_patches = _encode_pixel_patches(patches_px).to(torch.float32)        # [B,Cz,nt,H',W']
+        _, Cz, nt, Hlat, Wlat = z_patches.shape
+
+        def _append_dims(v: torch.Tensor, target_ndim: int) -> torch.Tensor:
+            return v[(...,) + (None,) * (target_ndim - v.ndim)]
+
+        raw_model = self.accelerator.unwrap_model(self.model)
+
+        # -- loop over fixed t's
+        for t_scalar in t_values:
+            t_vec = torch.full((B,), float(t_scalar), device=device)            # [B]
+            noise = torch.randn_like(z_patches)
+            x_t   = (1.0 - _append_dims(t_vec, z_patches.ndim)) * z_patches + \
+                    _append_dims(t_vec, z_patches.ndim) * noise
+
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                u = raw_model(x_t.to(torch.bfloat16),
+                            (t_vec * float(self.t_scale)).to(torch.bfloat16)).float()
+            x0_lat = x_t - _append_dims(t_vec, z_patches.ndim) * u              # [B,Cz,nt,H',W']
+
+            # decode predicted x0 to pixels for visualization
+            x0_px = _decode_latent_patches(x0_lat)                              # [B,2,pt,ph,pw]
+
+            # -- build grid video of magnitudes
+            rows = int(vcfg.get("grid_rows", 2))
+            cols = int(vcfg.get("grid_cols", max(1, (B + rows - 1) // rows)))
+            Tvid = int(x0_px.shape[2])
+            frames = []
+            for tt in range(Tvid):
+                row_tiles = []
+                for r in range(rows):
+                    col_tiles = []
+                    for c in range(cols):
+                        idx = r * cols + c
+                        if idx < B:
+                            patch = x0_px[idx]                                   # [2,pt,ph,pw]
+                            mag = torch.sqrt(torch.clamp(patch[0, tt]**2 + patch[1, tt]**2, min=0.0))
+                        else:
+                            mag = torch.zeros_like(x0_px[0, 0, tt])
+                        col_tiles.append(mag)
+                    row_tiles.append(torch.cat(col_tiles, dim=-1))
+                grid_img = torch.cat(row_tiles, dim=-2)                           # [rows*ph, cols*pw]
+                frames.append(_frame_to_uint8(grid_img.unsqueeze(0)))
+
+            arr = np.stack(frames, axis=0)                                        # [T,Hgrid,Wgrid]
+            arr = arr[:, None, :, :]
+            arr = np.repeat(arr, 3, axis=1)
+            vid = wandb.Video(arr, fps=int(self.cfg.get("logging", {}).get("latent_grid_fps", 7)), format="mp4")
+
+            if self.accelerator.is_main_process:
+                tag = f"val_latent/x0_pred_from_data_t_{t_scalar:.2f}".replace(".", "p")
+                wandb.log({tag: vid}, step=self.global_step)
+
+        self.model.train()
+
+    @torch.no_grad()
     def validation_simple(self, use_ema: bool = False):
         """
         Simple validation using a plain Euler (x0) reverse sampler:
@@ -655,7 +823,6 @@ class LatentFMTrainer:
             return v[(...,) + (None,) * (target_ndim - v.ndim)]
 
         def _sample_euler_x0_velocity(net, noise: torch.Tensor, sigmas: torch.Tensor) -> torch.Tensor:
-            from tqdm.auto import tqdm
             import time as _time
             x = noise.to(torch.float32)
             B = x.shape[0]
@@ -739,84 +906,73 @@ class LatentFMTrainer:
 
         self.model.train()
 
-    @torch.no_grad()
     def validation_simple_inv(self, use_ema: bool = False):
         """
-        Simple validation with Euler(x0) + MRI DC:
-        • pick one validation video [2,T,H,W]
-        • spatially patchify with 5% overlap (NO temporal patchify)
-        • process temporal chunks of length pt with 1-frame overlap
-        • inside Euler step, after x0_pred:
-                decode -> assemble full frame -> k-space hard replace rows from GT using GRO mask (R=8)
-                -> re-patchify (same coords) -> re-encode -> use as x0 for the Euler update
-        • logs a quick magnitude video per chunk
-        """
-        device = self.accelerator.device
+        Euler(x0) + pixel-space DC (L2 vs zero-filled) with **grads only inside DC**.
 
-        # ---------------- config ----------------
+        • Pick one validation video [2,T,H,W]
+        • Spatially tile (default 5% overlap) → P latent patches
+        • Process temporal chunks of length pt with 1-frame overlap
+        • Each Euler step:
+            - net forward (no grad)
+            - build x0_pred (latent)
+            - DC: micro-batched decode-with-grad → assemble → loss vs x_zf → grad step in latent space
+            - Euler update using x0 after DC
+        • Logs per-chunk recon and a final full-video recon to W&B
+        """
+        import time
+        import numpy as _np
+        import torch
+        from tqdm.auto import tqdm
+        from data.deg import MRIDeg  # mask provider
+
+        device = self.accelerator.device
+        self.model.eval()
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if use_ema:
+            self.ema.apply_to(unwrapped)
+
+        # -------------- config --------------
         vcfg   = self.cfg.get("validation", {})
         ph     = int(vcfg.get("patch_h", 80))
         pw     = int(vcfg.get("patch_w", 80))
-        pt     = int(vcfg.get("patch_t", 7))      # temporal chunk length in pixel space
-        bs_vae = int(vcfg.get("patch_batch", 64)) # VAE encode/decode micro-batch
-
-        overlap_spatial_pct = 5.0                 # EXACTLY 5% spatial overlap
+        pt     = int(vcfg.get("patch_t", 7))            # temporal chunk in *pixel* space
+        bs_vae = int(vcfg.get("patch_batch", 64))       # VAE streaming batch
+        dc_patch_mb = int(vcfg.get("dc_patch_mb", 8))   # micro-batch over patches for DC
+        overlap_spatial_pct = float(vcfg.get("overlap_spatial_pct", 5.0))
         R_default = int(self.cfg.get("deg", {}).get("R", 8))
+        dc_lambda = float(vcfg.get("dc_lambda", 0.3))
 
+        # cap any large VAE decode batch to 8 during sampling for memory safety
+        bs_vae = min(bs_vae, 8)
+
+        # -------------- small helpers --------------
         def _pct_to_stride_len(P, pct):
             ov = max(0.0, min(99.0, float(pct))) / 100.0
-            return max(1, int(math.ceil(P * (1.0 - ov))))
+            return max(1, int(torch.ceil(torch.tensor(P * (1.0 - ov))).item()))
 
-        sh = _pct_to_stride_len(ph, overlap_spatial_pct)
-        sw = _pct_to_stride_len(pw, overlap_spatial_pct)
+        def _append_dims(v: torch.Tensor, target_ndim: int) -> torch.Tensor:
+            return v[(...,) + (None,) * (target_ndim - v.ndim)]
 
-        # ---------------- FFT helpers for [2,T,H,W] ----------------
+        def _temporal_chunk_starts(T: int, win: int):
+            if win >= T: return [0]
+            step = max(1, win - 1)  # 1-frame overlap
+            arr = list(range(0, T - win + 1, step))
+            if arr[-1] != T - win:
+                arr.append(T - win)
+            return arr
+
         def _fft2c(x_2thw: torch.Tensor) -> torch.Tensor:
-            """
-            Centered 2D FFT (MRI convention), identical to data/deg.py:
-                k  = fft2(x, norm="ortho")
-                kc = fftshift(k, dim=(-2,-1))
-            """
             xr, xi = x_2thw[0], x_2thw[1]
-            xc = torch.complex(xr, xi)                                    # [T,H,W] complex
+            xc = torch.complex(xr, xi)
             k  = torch.fft.fft2(xc, norm="ortho")
             kc = torch.fft.fftshift(k, dim=(-2, -1))
-            return torch.stack((kc.real, kc.imag), dim=0)                  # [2,T,H,W] (centered)
+            return kc  # complex [T,H,W]
 
-        def _ifft2c(kc_2thw: torch.Tensor) -> torch.Tensor:
-            """
-            Inverse of _fft2c (centered domain in, image out), identical to data/deg.py:
-                k = ifftshift(kc, dim=(-2,-1))
-                x = ifft2(k, norm="ortho")
-            """
-            kr, ki = kc_2thw[0], kc_2thw[1]
-            kc = torch.complex(kr, ki)                                     # [T,H,W] complex (centered)
-            k  = torch.fft.ifftshift(kc, dim=(-2, -1))
+        def _ifft2c(kc_thw: torch.Tensor) -> torch.Tensor:
+            k  = torch.fft.ifftshift(kc_thw, dim=(-2, -1))
             x  = torch.fft.ifft2(k, norm="ortho")
-            return torch.stack((x.real, x.imag), dim=0)                    # [2,T,H,W]
-
-        # ---------------- spatial tiling ----------------
-        def _spatial_coords(H: int, W: int, ph: int, pw: int, sh: int, sw: int):
-            n1 = max(1, math.ceil((H - ph) / sh) + 1)
-            n2 = max(1, math.ceil((W - pw) / sw) + 1)
-            coords = []
-            for j in range(n1):
-                y0 = j * sh; y1 = min(y0 + ph, H); s1 = y1 - y0
-                for k in range(n2):
-                    x0 = k * sw; x1 = min(x0 + pw, W); s2 = x1 - x0
-                    coords.append((y0, y1, s1, x0, x1, s2, j, k, n1, n2))
-            return coords, n1, n2
-
-        def _spatial_patchify_video(x_2thw: torch.Tensor, ph: int, pw: int, sh: int, sw: int, coords):
-            # x: [2,T,H,W] -> [P,2,T,ph,pw]
-            _, T, H, W = x_2thw.shape
-            P = len(coords)
-            out = torch.zeros((P, 2, T, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
-            for idx, (y0,y1,s1,x0,x1,s2, *_rest) in enumerate(coords):
-                patch = torch.zeros((2, T, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
-                patch[:, :, :s1, :s2] = x_2thw[:, :, y0:y1, x0:x1]
-                out[idx] = patch
-            return out
+            return x  # complex [T,H,W]
 
         def _axis_weights(L_eff: int, idx: int, n: int, O: int, device):
             has_prev = (idx > 0); has_next = (idx < n - 1)
@@ -838,10 +994,29 @@ class LatentFMTrainer:
                 w[-L_right:] = 0.5 if L_right == 1 else torch.linspace(1.0, 0.0, steps=L_right, device=device)
             return w
 
+        def _spatial_coords(H: int, W: int, ph: int, pw: int, sh: int, sw: int):
+            n1 = max(1, (H - ph + sh - 1) // sh + 1)
+            n2 = max(1, (W - pw + sw - 1) // sw + 1)
+            coords = []
+            for j in range(n1):
+                y0 = j * sh; y1 = min(y0 + ph, H); s1 = y1 - y0
+                for k in range(n2):
+                    x0 = k * sw; x1 = min(x0 + pw, W); s2 = x1 - x0
+                    coords.append((y0, y1, s1, x0, x1, s2, j, k, n1, n2))
+            return coords, n1, n2
+
+        def _spatial_patchify_video(x_2thw: torch.Tensor, ph: int, pw: int, sh: int, sw: int, coords):
+            _, Tt, Hh, Ww = x_2thw.shape
+            out = torch.zeros((len(coords), 2, Tt, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
+            for idx, (y0,y1,s1,x0,x1,s2, *_rest) in enumerate(coords):
+                patch = torch.zeros((2, Tt, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
+                patch[:, :, :s1, :s2] = x_2thw[:, :, y0:y1, x0:x1]
+                out[idx] = patch
+            return out  # [P,2,T,ph,pw]
+
         def _depatchify2d_over_time(patches_P2Thw: torch.Tensor,
                                     H: int, W: int, ph: int, pw: int, sh: int, sw: int,
                                     coords) -> torch.Tensor:
-            # patches: [P, 2, T, ph, pw] -> [2, T, H, W]
             device = patches_P2Thw.device
             dtype  = patches_P2Thw.dtype
             P, _, T, _, _ = patches_P2Thw.shape
@@ -861,50 +1036,65 @@ class LatentFMTrainer:
             out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
             return out_num / out_den.to(out_num.dtype)
 
-        # ---------------- VAE helpers ----------------
-        def _decode_latent_patches(z_Pcnhw: torch.Tensor) -> torch.Tensor:
-            # [P,Cz,nt,H',W'] -> [P,2,pt,ph,pw]
+        def _decode_latent_patches(z_Pcnhw: torch.Tensor, max_bs: int) -> torch.Tensor:
             outs = []
-            for i in range(0, z_Pcnhw.shape[0], bs_vae):
-                chunk = z_Pcnhw[i:i+bs_vae]
-                z_list = [z.unsqueeze(0) for z in chunk]         # list [1,Cz,nt,H',W']
-                dec = self.vae(z_list, op="decode")              # list of [1,2,pt,ph,pw]
+            for i in range(0, z_Pcnhw.shape[0], max_bs):
+                chunk = z_Pcnhw[i:i+max_bs]
+                z_list = [z.unsqueeze(0) for z in chunk]  # list [1,Cz,nt,H',W']
+                dec = self.vae(z_list, op="decode")       # list [1,2,pt,ph,pw]
                 for o in dec:
                     if isinstance(o, (list, tuple)): o = o[0]
-                    outs.append(o.squeeze(0))                    # [2,pt,ph,pw]
-            return torch.stack(outs, dim=0)
+                    outs.append(o.squeeze(0))            # [2,pt,ph,pw]
+            return torch.stack(outs, dim=0)              # [P,2,pt,ph,pw]
 
-        def _encode_pixel_patches(patches_P2thw: torch.Tensor) -> torch.Tensor:
-            # [P,2,pt,ph,pw] -> [P,Cz,nt,H',W']
-            outs = []
-            for i in range(0, patches_P2thw.shape[0], bs_vae):
-                chunk = patches_P2thw[i:i+bs_vae]
-                x_list = [x for x in chunk]                      # list of [2,pt,ph,pw]
-                pairs = self.vae(x_list, op="encode")            # list of (mu, logv)
-                for pr in pairs:
-                    mu = pr[0] if isinstance(pr, (list, tuple)) else pr
-                    if mu.dim() == 5 and mu.shape[0] == 1:
-                        mu = mu.squeeze(0)
-                    outs.append(mu)                              # [Cz,nt,H',W']
-            return torch.stack(outs, dim=0)
+        def _assemble_subset_to_full(patches_subset: torch.Tensor, idxs, H, W, ph, pw, sh, sw, coords):
+            device = patches_subset.device
+            dtype  = patches_subset.dtype
+            Q, _, pt_eff, _, _ = patches_subset.shape
+            out_num = torch.zeros((2, pt_eff, H, W), dtype=torch.float32, device=device)
+            out_den = torch.zeros((1, pt_eff, H, W), dtype=torch.float32, device=device)
+            O1 = max(0, ph - sh); O2 = max(0, pw - sw)
+            n1 = coords[0][8]; n2 = coords[0][9]
+            for local_i, gidx in enumerate(idxs):
+                y0,y1,s1,x0,x1,s2,j,k, *_ = coords[gidx]
+                w1 = _axis_weights(s1, j, n1, O1, device)
+                w2 = _axis_weights(s2, k, n2, O2, device)
+                w  = (w1[None, None, :, None] * w2[None, None, None, :])  # [1,1,s1,s2]
+                p  = patches_subset[local_i][:, :, :s1, :s2].to(torch.float32)  # [2,pt,s1,s2]
+                out_num[:, :, y0:y1, x0:x1] += (p * w)
+                out_den[:, :, y0:y1, x0:x1] += w
+            out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
+            return out_num / out_den
 
-        def _temporal_chunk_starts(T: int, pt: int):
-            if pt >= T: return [0]
-            step = max(1, pt - 1)  # 1-frame overlap
-            starts = list(range(0, T - pt + 1, step))
-            if starts[-1] != T - pt:
-                starts.append(T - pt)
-            return starts
+        @torch.no_grad()
+        def _assemble_full_from_latents_nograd(vae, z_Pcnhw, H, W, ph, pw, sh, sw, coords, max_bs):
+            out_num = None
+            out_den = None
+            O1 = max(0, ph - sh); O2 = max(0, pw - sw)
+            n1 = coords[0][8]; n2 = coords[0][9]
+            idx = 0
+            for i in range(0, z_Pcnhw.shape[0], max_bs):
+                chunk = z_Pcnhw[i:i+max_bs]
+                z_list = [zz.unsqueeze(0) for zz in chunk]
+                dec = vae(z_list, op="decode")  # list of [1,2,pt,ph,pw]
+                for o in dec:
+                    if isinstance(o, (list, tuple)): o = o[0]
+                    p = o.squeeze(0).to(torch.float32)  # [2,pt,ph,pw]
+                    if out_num is None:
+                        pt_eff = int(p.shape[1])
+                        out_num = torch.zeros((2, pt_eff, H, W), dtype=torch.float32, device=z_Pcnhw.device)
+                        out_den = torch.zeros((1, pt_eff, H, W), dtype=torch.float32, device=z_Pcnhw.device)
+                    y0,y1,s1,x0,x1,s2,j,k, *_ = coords[idx]
+                    w1 = _axis_weights(s1, j, n1, O1, z_Pcnhw.device)
+                    w2 = _axis_weights(s2, k, n2, O2, z_Pcnhw.device)
+                    w  = (w1[None, None, :, None] * w2[None, None, None, :])      # [1,1,s1,s2]
+                    out_num[:, :, y0:y1, x0:x1] += (p[:, :, :s1, :s2] * w)
+                    out_den[:, :, y0:y1, x0:x1] += w
+                    idx += 1
+            out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
+            return out_num / out_den
 
-        def _append_dims(v: torch.Tensor, target_ndim: int) -> torch.Tensor:
-            return v[(...,) + (None,) * (target_ndim - v.ndim)]
-
-        # ---------------- pull one validation video ----------------
-        self.model.eval()
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        if use_ema:
-            self.ema.apply_to(unwrapped)
-
+        # -------------- get one validation video --------------
         try:
             val_it = iter(self.val_dl)
             batch_list = next(val_it)
@@ -914,21 +1104,23 @@ class LatentFMTrainer:
                 break
         except StopIteration:
             if self.accelerator.is_main_process:
-                print("[validation_simple] empty val loader")
+                print("[validation_simple_inv] empty val loader")
             if use_ema:
                 self.ema.restore(unwrapped)
             self.model.train()
             return
 
-        x_true = x_true.to(device=device, dtype=torch.float32)  # [2,T,H,W] (or [2,1,H,W])
+        x_true = x_true.to(device=device, dtype=torch.float32)
         if x_true.dim() == 3:
             x_true = x_true.unsqueeze(1)
         _, T, H, W = x_true.shape
 
+        sh = _pct_to_stride_len(ph, overlap_spatial_pct)
+        sw = _pct_to_stride_len(pw, overlap_spatial_pct)
         coords, n1, n2 = _spatial_coords(H, W, ph, pw, sh, sw)
         P = len(coords)
 
-        # latent geometry from dummy encode at this pt/ph/pw
+        # latent geometry via dummy encode at this pt/ph/pw
         dummy = torch.zeros(1, 2, pt, ph, pw, device=device, dtype=torch.float32)
         vae_out = self.vae([dummy], op="encode")
         mu0 = vae_out[0][0] if isinstance(vae_out[0], (list, tuple)) else vae_out[0]
@@ -936,78 +1128,117 @@ class LatentFMTrainer:
             mu0 = mu0.squeeze(0)
         Cz, nt, Hlat, Wlat = int(mu0.shape[0]), int(mu0.shape[1]), int(mu0.shape[2]), int(mu0.shape[3])
 
-        # linear sigmas (1 -> 0), float32
-        scfg  = self.cfg.get("sampler", {})
-        steps = int(scfg.get("num_steps", 25))
+        # linear sigmas (1 -> 0), fp32
+        steps = int(self.cfg.get("sampler", {}).get("num_steps", 25))
         sigmas = torch.linspace(1.0, 0.0, steps=steps + 1, device=device, dtype=torch.float32)
 
-        # ---------------- data consistency ----------------
-        def _get_mask_tky(H: int, Tc: int, R: int):
-            deg = MRIDeg(H, Tc, R)                 # uses your top-level import
-            mk = getattr(deg, "mask_ky_t", None)
-            if callable(mk):                       # support array OR callable
-                mk = mk()
-            if mk is None:
-                raise RuntimeError("MRIDeg has no mask_ky_t (array or callable).")
-            mask = torch.as_tensor(mk, device=device, dtype=torch.float32)  # [ky,Tc] or [Tc,ky]
-            if mask.shape == (H, Tc):
-                mask = mask.t()
-            elif mask.shape != (Tc, H):
-                raise RuntimeError(f"Unexpected GRO mask shape {tuple(mask.shape)}; expected (H,Tc) or (Tc,H).")
-            return mask.view(1, Tc, H, 1)  # [1,Tc,H,1] broadcast over kx and channels
-
-        def data_consistency(x0_pred_lat_Pcnhw: torch.Tensor, x_true_chunk_2thw: torch.Tensor, R: int = R_default) -> torch.Tensor:
-            # 1) decode latents → pixel patches
-            patches_dec = _decode_latent_patches(x0_pred_lat_Pcnhw)       # [P,2,pt,ph,pw]
-            # 2) assemble full-frame chunk
-            x0_full = _depatchify2d_over_time(patches_dec, H, W, ph, pw, sh, sw, coords)  # [2,pt,H,W]
-            # 3) k-space hard replace using GRO mask
-            Tc = int(x_true_chunk_2thw.shape[1])
-            mask = _get_mask_tky(H, Tc, R)                                 # [1,Tc,H,1]
-            k_est  = _fft2c(x0_full)                                       # [2,pt,H,W]
-            k_true = _fft2c(x_true_chunk_2thw)
-            k_corr = k_est * (1.0 - mask) + k_true * mask                  # broadcast across kx and channels
-            x_dc_full = _ifft2c(k_corr)                                    # [2,pt,H,W]
-            # 4) re-patchify (spatial) and re-encode to latents
-            dc_patches = _spatial_patchify_video(x_dc_full, ph, pw, sh, sw, coords)  # [P,2,pt,ph,pw]
-            return _encode_pixel_patches(dc_patches)                       # [P,Cz,nt,H',W']
-
-        # ---------------- Euler(x0) with DC ----------------
-        def _sample_euler_x0_velocity_with_dc(raw_model, noise: torch.Tensor, sigmas: torch.Tensor,
-                                            x_true_chunk_2thw: torch.Tensor) -> torch.Tensor:
+        # -------------- DC: chunked grad step on z --------------
+        def _dc_latent_from_x0(z_lat_Pcnhw: torch.Tensor,
+                            x_zf_TcHW: torch.Tensor,          # complex [Tc,H,W]
+                            step_vec_P: torch.Tensor) -> torch.Tensor:
             """
-            noise: [P,Cz,nt,Hlat,Wlat], x_true_chunk_2thw: [2,pt,H,W]
-            returns: [P,Cz,nt,Hlat,Wlat]
+            Compute ∂L/∂z for small groups of patches and apply a gradient step:
+                L = mean(|| S(z) - x_zf ||^2)  where S(z) is overlap-add decode.
+            Only z requires grad; model/vae are frozen.
             """
-            x = noise.to(torch.float32)
+            z = z_lat_Pcnhw
+            if not z.requires_grad:
+                z = z.clone().requires_grad_(True)
+
+            with torch.no_grad():
+                S0 = _assemble_full_from_latents_nograd(self.vae, z.detach(),
+                                                        H, W, ph, pw, sh, sw, coords, max_bs=bs_vae)  # [2,pt,H,W]
+                pt_eff = int(S0.shape[1])
+                Tc = int(x_zf_TcHW.shape[0])
+                if pt_eff != Tc:
+                    if Tc < pt_eff:
+                        pad = pt_eff - Tc
+                        x_zf = torch.cat([x_zf_TcHW,
+                                        torch.zeros((pad, H, W), device=device, dtype=x_zf_TcHW.dtype)], dim=0)
+                    else:
+                        x_zf = x_zf_TcHW[:pt_eff]
+                else:
+                    x_zf = x_zf_TcHW
+                R_full = torch.stack((S0[0], S0[1]), dim=0) - \
+                        torch.stack((x_zf.real.float(), x_zf.imag.float()), dim=0)  # [2,pt,H,W] fp32
+
+            # micro-batch over patches
+            Ptot = int(z.shape[0])
+            for i0 in range(0, Ptot, dc_patch_mb):
+                i1 = min(i0 + dc_patch_mb, Ptot)
+                idxs = list(range(i0, i1))
+                z_chunk = z[i0:i1]
+                z_chunk.requires_grad_(True)
+
+                # decode with grad (bf16 autocast ok), then assemble only this chunk
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    z_list = [zz.unsqueeze(0) for zz in z_chunk]               # list [1,Cz,nt,H',W']
+                    dec = self.vae(z_list, op="decode")                         # list [1,2,pt,ph,pw]
+                    patches = []
+                    for o in dec:
+                        if isinstance(o, (list, tuple)): o = o[0]
+                        patches.append(o.squeeze(0))                            # [2,pt,ph,pw], bf16
+                    patches = torch.stack(patches, dim=0)                       # [Q,2,pt,ph,pw]
+
+                C_chunk = _assemble_subset_to_full(patches, idxs, H, W, ph, pw, sh, sw, coords)  # [2,pt,H,W] fp32
+                C_ng = C_chunk.detach()
+                L = (C_chunk + (R_full - C_ng)).pow(2).mean()                   # scalar fp32
+
+                (g_chunk,) = torch.autograd.grad(L, z_chunk, retain_graph=False, create_graph=False)
+
+                zs = step_vec_P[i0:i1].view(-1, *([1] * (z_chunk.ndim - 1)))
+                z_new = z_chunk - zs * g_chunk
+
+                with torch.no_grad():
+                    z[i0:i1].copy_(z_new)
+
+                del z_chunk, patches, C_chunk, C_ng, L, g_chunk
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            return z
+
+        # -------------- Euler(x0) + DC for one chunk --------------
+        def _sample_euler_x0_with_dc(raw_model, noise: torch.Tensor,
+                                    sigmas: torch.Tensor,
+                                    x_zf_chunk_cmplx: torch.Tensor) -> torch.Tensor:
+            """
+            noise: [P,Cz,nt,H',W']; x_zf_chunk_cmplx: complex [Tc<=pt, H, W]
+            returns: [P,Cz,nt,H',W']
+            """
+            x = noise.to(torch.float32)  # latent state (fp32)
             B = x.shape[0]
             total = sigmas.numel() - 1
 
-            pbar = tqdm(
-                total=total,
-                desc="Euler(x0)+DC",
-                dynamic_ncols=True,
-                leave=False,
-                disable=not self.accelerator.is_main_process,
-            )
+            pbar = tqdm(total=total,
+                        desc="Euler(x0)+DC",
+                        dynamic_ncols=True,
+                        leave=False,
+                        disable=not self.accelerator.is_main_process)
             last = time.perf_counter()
 
             for i in range(total):
-                t = sigmas[i].expand(B)      # [B]
-                s = sigmas[i + 1].expand(B)  # [B]
+                t = sigmas[i].expand(B)      # [P]
+                s = sigmas[i + 1].expand(B)  # [P]
 
-                x_bf16 = x.to(torch.bfloat16)
-                t_bf16 = (t * float(self.t_scale)).to(torch.bfloat16)
-                u = raw_model(x_bf16, t_bf16).to(torch.float32)  # velocity
+                # model velocity (no grad; bf16 autocast)
+                with torch.no_grad():
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        u = raw_model(x.to(torch.bfloat16),
+                                    (t * float(self.t_scale)).to(torch.bfloat16)).to(torch.float32)
 
-                # predictor x0 (latent)
+                # predictor in latent space
                 x0_pred = x - _append_dims(t, x.ndim) * u
 
-                # === data consistency on x0_pred (latent→pixel→kspace replace→latent) ===
-                x0_dc = data_consistency(x0_pred, x_true_chunk_2thw, R=R_default)
+                # DC every step: chunked grad only on z
+                step_vec = (t - s).abs() * dc_lambda  # [P]
+                with torch.enable_grad():
+                    x0_dc = _dc_latent_from_x0(x0_pred, x_zf_chunk_cmplx, step_vec)  # [P,Cz,nt,H',W']
 
+                # Euler(x0) update with DC-corrected x0
                 ratio = _append_dims((s / t.clamp_min(1e-8)), x.ndim)
                 x = ratio * x + (1.0 - ratio) * x0_dc
+                x = x.detach()  # prevent graph growth
 
                 if self.accelerator.is_main_process:
                     now = time.perf_counter()
@@ -1021,38 +1252,92 @@ class LatentFMTrainer:
 
         raw_model = self.accelerator.unwrap_model(self.model)
 
-        # ---------------- temporal chunks (1-frame overlap) ----------------
+        # -------------- temporal chunks --------------
         starts = _temporal_chunk_starts(T, pt)
+        recon_frames = []  # list of [2,H,W] tensors in time order
+        prev_start, prev_len = None, None
+
+        # build zero-filled target per chunk once we know Tc
         for t0 in starts:
             t1 = min(t0 + pt, T)
-            x_true_chunk = x_true[:, t0:t1]                          # [2,≤pt,H,W]
-            Tc_valid = x_true_chunk.shape[1]
+            Tc_valid = int(t1 - t0)
+            x_true_chunk = x_true[:, t0:t1]  # [2,Tc_valid,H,W]
+
+            # MR sampling mask over ky×time for this chunk
+            deg = MRIDeg(H, Tc_valid, R_default)
+            mk = getattr(deg, "mask_ky_t", None)
+            if callable(mk): mk = mk()
+            m_TH = torch.as_tensor(mk, device=device, dtype=torch.float32)
+            if m_TH.shape == (H, Tc_valid):
+                m_TH = m_TH.t()  # [Tc_valid, H]
+            m_THW = m_TH[:, :, None].expand(Tc_valid, H, W)  # [Tc_valid,H,W]
+
+            # zero-filled complex pixels
+            kc_true = _fft2c(x_true_chunk)                            # complex [Tc_valid,H,W]
+            kc_meas = kc_true * m_THW                                 # sampled k-space
+            x_zf = _ifft2c(kc_meas)                                   # complex [Tc_valid,H,W]
+
+            # pad to pt for the sampler/DC if needed
             if Tc_valid < pt:
                 pad = pt - Tc_valid
-                pad_tail = torch.zeros((2, pad, H, W), device=device, dtype=x_true_chunk.dtype)
-                x_true_chunk = torch.cat([x_true_chunk, pad_tail], dim=1)  # [2,pt,H,W]
+                pad_c = torch.zeros((pad, H, W), device=device, dtype=x_zf.dtype)
+                x_zf_chunk = torch.cat([x_zf, pad_c], dim=0)          # [pt,H,W] complex
+            else:
+                x_zf_chunk = x_zf                                     # [pt,H,W]
 
             # init latent noise for all spatial patches
             noise = torch.randn((P, Cz, nt, Hlat, Wlat), device=device, dtype=torch.float32)
 
-            # sample with DC
-            z_x0 = _sample_euler_x0_velocity_with_dc(raw_model, noise, sigmas, x_true_chunk)  # [P,Cz,nt,Hlat,Wlat]
+            # run Euler(x0)+DC
+            z_x0 = _sample_euler_x0_with_dc(raw_model, noise, sigmas, x_zf_chunk)  # [P,Cz,nt,H',W']
 
-            # decode for quick logging
-            patches_dec = _decode_latent_patches(z_x0)                # [P,2,pt,ph,pw]
-            xhat_full   = _depatchify2d_over_time(patches_dec, H, W, ph, pw, sh, sw, coords)  # [2,pt,H,W]
+            # decode & assemble to full [2,pt,H,W] (no grad)
+            with torch.no_grad():
+                patches_dec = _decode_latent_patches(z_x0, max_bs=bs_vae)                      # [P,2,pt,ph,pw]
+                xhat_full   = _depatchify2d_over_time(patches_dec, H, W, ph, pw, sh, sw, coords)  # [2,pt,H,W]
 
-            # log magnitude video for this chunk (use only valid Tc_valid frames)
+            # log per-chunk video (valid frames only)
             if self.accelerator.is_main_process:
                 frames = []
                 for tt in range(Tc_valid):
                     mag = torch.sqrt(torch.clamp(xhat_full[0, tt]**2 + xhat_full[1, tt]**2, min=0.0)).unsqueeze(0)
-                    frames.append(_frame_to_uint8(mag))   # <-- fix: use module-level helper
-                arr = np.stack(frames, axis=0)            # [Tvalid, H, W]
+                    frames.append(_frame_to_uint8(mag))  # uses your helper
+                arr = _np.stack(frames, axis=0)            # [Tc_valid,H,W]
                 arr = arr[:, None, :, :]
-                arr = np.repeat(arr, 3, axis=1)
+                arr = _np.repeat(arr, 3, axis=1)
                 vid = wandb.Video(arr, fps=int(self.cfg.get("logging", {}).get("latent_grid_fps", 7)), format="mp4")
-                wandb.log({f"val/simple_dc_chunk_{t0:04d}": vid}, step=self.global_step)
+                wandb.log({f"val/dc_chunk_{t0:04d}": vid}, step=self.global_step)
+
+            # collect recon frames (stitch across overlapping chunks)
+            if prev_start is None:
+                for f in range(Tc_valid):
+                    recon_frames.append(xhat_full[:, f])
+                prev_start, prev_len = t0, Tc_valid
+            else:
+                overlap = max(0, (prev_start + prev_len) - t0)
+                start_f = min(overlap, Tc_valid)
+                for f in range(start_f, Tc_valid):
+                    recon_frames.append(xhat_full[:, f])
+                prev_start, prev_len = t0, Tc_valid
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            break
+
+        # -------------- final full-video logging --------------
+        with torch.no_grad():
+            recon = torch.stack(recon_frames, dim=1)  # [2,T,H,W]
+            if self.accelerator.is_main_process:
+                frames = []
+                for t in range(T):
+                    mag = torch.sqrt(torch.clamp(recon[0, t]**2 + recon[1, t]**2, min=0.0)).unsqueeze(0)
+                    frames.append(_frame_to_uint8(mag))
+                arr = _np.stack(frames, axis=0)
+                arr = arr[:, None, :, :]
+                arr = _np.repeat(arr, 3, axis=1)
+                vid = wandb.Video(arr, fps=int(self.cfg.get("logging", {}).get("latent_grid_fps", 7)), format="mp4")
+                wandb.log({"val/recon_dc": vid}, step=self.global_step)
 
         if use_ema:
             self.ema.restore(unwrapped)
@@ -1083,7 +1368,6 @@ class LatentFMTrainer:
 
 
 # ==================== DataLoader builder ====================
-
 def build_dataloader(ds_cfg: Dict[str, Any], dl_cfg: Dict[str, Any], is_train: bool) -> DataLoader:
     ds_name = ds_cfg["name"]
     DS = try_import_dataset(ds_name)
@@ -1096,7 +1380,8 @@ def build_dataloader(ds_cfg: Dict[str, Any], dl_cfg: Dict[str, Any], is_train: b
         num_workers=dl_cfg.get("num_workers", 4),
         pin_memory=dl_cfg.get("pin_memory", True),
         drop_last=is_train,
-        collate_fn=ragged_collate,
+        # IMPORTANT: default collate for train now (no ragged lists)
+        collate_fn=None if is_train else ragged_collate,
     )
 
 
