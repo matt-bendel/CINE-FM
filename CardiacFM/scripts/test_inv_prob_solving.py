@@ -16,6 +16,15 @@ try:
 except Exception:
     imageio = None
 
+def load_teacache_poly(json_path: str):
+    import json, os
+    if (json_path is None) or (not os.path.isfile(json_path)):
+        return None
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    # expects keys: 'coeffs_high_to_low' and 'poly_order'
+    return data.get("coeffs_high_to_low", None)
+
 # ---------- utils: dynamic import & dataset ----------
 def dynamic_import(import_path: str, class_name: str):
     mod = importlib.import_module(import_path)
@@ -168,7 +177,6 @@ def encode_pixel_patches(vae, patches_P2thw: torch.Tensor, bs_vae: int) -> torch
     return torch.stack(outs, dim=0)
 
 # ---------- core: run one full-video inverse validation for a given model ----------
-@torch.no_grad()
 def run_validation_inv_once(
     model,
     vae,
@@ -181,16 +189,26 @@ def run_validation_inv_once(
     tag: str = "raw",
     save_chunk_videos: bool = False,
     seed: int = 1234,
-    # --- NEW knobs ---
-    phase_only: bool = True,       # global phase align per frame before DC
-    dc_lambda: float = 0.3,        # soft DC strength (0=no DC, 1=hard replace-at-this-step)
-    dc_every: int = 4,             # perform DC every N solver steps (and at the last step)
+    # DC knobs (interpreted for grad-based DC here)
+    phase_only: bool = True,       # (kept for API; not used in pixel-space DC below)
+    dc_lambda: float = 0.3,        # scales per-step DC step size (see eta_dc below)
+    dc_every: int = 4,             # apply DC every N solver steps (and on last)
     save_center_over_steps: bool = True,
-    save_full_every: int = 0,      # if >0, dump full-pt videos every N DC applications
+    save_full_every: int = 0,
 ):
     """
-    Euler(x0)+DC using ONLY measured k-space (masked GT) to emulate scanner input.
-    Soft, infrequent DC stabilizes latent trajectory. Also logs intermediate x0-after-DC.
+    Euler(x0) + periodic **pixel-space** data consistency with gradients:
+
+      • Measurements used by DC are the zero-filled pixels x_zf (complex).
+      • For a candidate latent x0 (patch-batched), we:
+          1) decode → depatchify to pixels,
+          2) undersample in k-space with the same centered mask, IFFT back to pixels,
+          3) compute L2 loss vs. x_zf (pixel-space),
+          4) autograd to get ∂L/∂(latent patches) for each patch, and
+          5) take a small step in latent space.
+
+      The step size per solver step is:  eta_dc = dc_lambda * |t - s|.
+      DC is applied every `dc_every` steps and at the last step.
     """
     device = x_true_2thw.device
     vcfg   = cfg.get("validation", {})
@@ -198,7 +216,7 @@ def run_validation_inv_once(
     pw     = int(vcfg.get("patch_w", 80))
     pt     = int(vcfg.get("patch_t", 7))
     bs_vae = int(vcfg.get("patch_batch", 64))
-    overlap_spatial_pct = 5.0
+    overlap_spatial_pct = 1.0
     dc_lambda = float(max(0.0, min(1.0, dc_lambda)))
     dc_every  = max(1, int(dc_every))
 
@@ -213,18 +231,19 @@ def run_validation_inv_once(
     P = len(coords)
 
     # ---------- latent geometry ----------
-    dummy = torch.zeros(1, 2, pt, ph, pw, device=device, dtype=torch.float32)
-    vae_out = vae([dummy], op="encode")
-    mu0 = vae_out[0][0] if isinstance(vae_out[0], (list, tuple)) else vae_out[0]
-    if mu0.dim() == 5 and mu0.shape[0] == 1:
-        mu0 = mu0.squeeze(0)
-    Cz, nt, Hlat, Wlat = int(mu0.shape[0]), int(mu0.shape[1]), int(mu0.shape[2]), int(mu0.shape[3])
+    with torch.no_grad():
+        dummy = torch.zeros(1, 2, pt, ph, pw, device=device, dtype=torch.float32)
+        vae_out = vae([dummy], op="encode")
+        mu0 = vae_out[0][0] if isinstance(vae_out[0], (list, tuple)) else vae_out[0]
+        if mu0.dim() == 5 and mu0.shape[0] == 1:
+            mu0 = mu0.squeeze(0)
+        Cz, nt, Hlat, Wlat = int(mu0.shape[0]), int(mu0.shape[1]), int(mu0.shape[2]), int(mu0.shape[3])
 
     # ---------- schedule ----------
     steps = int(cfg.get("sampler", {}).get("num_steps", 25))
     sigmas = torch.linspace(1.0, 0.0, steps=steps + 1, device=device, dtype=torch.float32)
 
-    # ---------- measured k-space (centered) from GT, but ONLY masked lines are used by DC ----------
+    # ---------- measured (centered) mask + zero-filled pixels ----------
     from data.deg import MRIDeg
     deg_full = MRIDeg(pe=H, fr=T, R=R, dsp=0, verbose=False)
     m_full_TH = torch.from_numpy(deg_full.mask_ky_t.T.copy()).to(device=device, dtype=torch.float32)  # [T,H]
@@ -236,9 +255,11 @@ def run_validation_inv_once(
     k_true_c = torch.fft.fftshift(k_true, dim=(-2, -1))
     k_meas_c_full = k_true_c * m_full_THW                                 # [T,H,W] complex
 
-    # zero-filled reference (useful to compare)
-    x_zf = torch.fft.ifft2(torch.fft.ifftshift(k_meas_c_full, dim=(-2, -1)), norm="ortho")
-    x_zf_ri = torch.stack((x_zf.real, x_zf.imag), dim=0)
+    # zero-filled (complex pixel space) reference
+    x_zf_full = torch.fft.ifft2(torch.fft.ifftshift(k_meas_c_full, dim=(-2, -1)), norm="ortho")  # [T,H,W] complex
+
+    # Save zero-filled magnitude video (optional but handy)
+    x_zf_ri = torch.stack((x_zf_full.real, x_zf_full.imag), dim=0)
     zf_frames = []
     for t in range(T):
         mag = torch.sqrt(torch.clamp(x_zf_ri[0, t]**2 + x_zf_ri[1, t]**2, min=0.0)).unsqueeze(0)
@@ -246,15 +267,48 @@ def run_validation_inv_once(
     save_video_gray(zf_frames, os.path.join(outdir, f"zfr_{tag}.mp4"),
                     fps=int(cfg.get("logging", {}).get("latent_grid_fps", 7)))
 
-    # ---------- small helpers ----------
+    # ---------- helpers ----------
     def _append_dims(v: torch.Tensor, target_ndim: int) -> torch.Tensor:
         return v[(...,) + (None,) * (target_ndim - v.ndim)]
 
     def depatchify(patches_P2Thw: torch.Tensor) -> torch.Tensor:
         return depatchify2d_over_time(patches_P2Thw, H, W, ph, pw, sh, sw, coords)
 
-    def spatial_patchify(x_2thw: torch.Tensor) -> torch.Tensor:
-        return spatial_patchify_video(x_2thw, ph, pw, sh, sw, coords)
+    # grad-enabled local decode (the global helper is @torch.no_grad(); we need grads)
+    def _decode_latent_patches_grad(vae, z_Pcnhw: torch.Tensor, bs: int) -> torch.Tensor:
+        outs = []
+        for i in range(0, z_Pcnhw.shape[0], bs):
+            chunk = z_Pcnhw[i:i+bs]
+            z_list = [zz.unsqueeze(0) for zz in chunk]       # [1,Cz,nt,H',W']
+            dec = vae(z_list, op="decode")                   # list of [1,2,pt,ph,pw]
+            for o in dec:
+                if isinstance(o, (list, tuple)): o = o[0]
+                outs.append(o.squeeze(0))                    # [2,pt,ph,pw]
+        return torch.stack(outs, dim=0)                      # [P,2,pt,ph,pw]
+    
+    def _decode_latent_patches_grad_streamed(vae, z_Pcnhw: torch.Tensor, max_bs: int = 1):
+        """
+        Decode with gradients but in tiny microbatches to cap peak memory.
+        Input:  z [P, Cz, nt, H', W']
+        Return: x [P, 2, pt, ph, pw] (requires grad wrt z_Pcnhw)
+        """
+        P = int(z_Pcnhw.shape[0])
+        outs = []
+        for i in range(0, P, max_bs):
+            z_chunk = z_Pcnhw[i:i+max_bs]                     # [B, Cz, nt, H', W']
+            # VAE API expects a list of [1,Cz,nt,H',W'] tensors
+            z_list = [zz.unsqueeze(0) for zz in z_chunk]      # list length B
+            # Important: do NOT use torch.no_grad, and keep dtype fp32/bf16 as you prefer
+            dec_list = vae(z_list, op="decode")               # list of [1,2,pt,ph,pw]
+            for o in dec_list:
+                if isinstance(o, (list, tuple)):
+                    o = o[0]
+                outs.append(o.squeeze(0))                     # [2,pt,ph,pw], grad-connected to z_chunk
+            # free cached blocks between microbatches
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return torch.stack(outs, dim=0)                       # [P,2,pt,ph,pw]
+
 
     # ---------- quick VAE round-trip sanity (warn if large) ----------
     with torch.no_grad():
@@ -262,54 +316,69 @@ def run_validation_inv_once(
         x_test = decode_latent_patches(vae, z_test, bs_vae)             # [4,2,pt,ph,pw]
         z_back = encode_pixel_patches(vae, x_test, bs_vae)              # [4,Cz,nt,H',W']
         rt_rel = (z_back - z_test).pow(2).mean().sqrt() / (z_test.pow(2).mean().sqrt() + 1e-8)
-        if float(rt_rel) > 0.15:  # heuristic
+        if float(rt_rel) > 0.15:
             print(f"[warn] VAE encode↔decode relative RMSE ~ {float(rt_rel):.3f} (possible VAE mismatch).")
 
-    # ---------- DC (masked-only; soft and optional phase-only) ----------
-    eps = 1e-12
+    # ---------- pixel-space DC (with grad) ----------
     def dc_latent_from_x0(
         x0_lat_Pcnhw: torch.Tensor,
-        y_meas_c_TcHW: torch.Tensor,    # [Tc,H,W] complex
-        m_chunk_TcHW: torch.Tensor,     # [Tc,H,W] float
-        return_pixel: bool = False,
+        x_zf_TcHW: torch.Tensor,      # zero-filled target in pixel space [Tc,H,W] (complex)
+        m_chunk_TcHW: torch.Tensor,   # [Tc,H,W] (unused in pixel-space loss; keep if needed elsewhere)
+        step_size: torch.Tensor,      # per-batch step size (broadcastable)
     ):
-        # decode → assemble
-        patches_dec = decode_latent_patches(vae, x0_lat_Pcnhw, bs_vae)          # [P,2,pt,ph,pw]
-        x0_full = depatchify(patches_dec)                                       # [2,pt,H,W]
+        # ---- ensure z (latents) require grad ----
+        z = x0_lat_Pcnhw
+        if not z.requires_grad:
+            z = z.clone().requires_grad_(True)
 
-        # to k-space (centered)
-        xc_est   = torch.complex(x0_full[0], x0_full[1])                        # [pt,H,W]
-        k_est    = torch.fft.fft2(xc_est, norm="ortho")
-        k_est_c  = torch.fft.fftshift(k_est, dim=(-2, -1))                      # [pt,H,W] complex
+        print(z.shape)
+        # ---- decode (streamed, grad-enabled) ----
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            x_patches = _decode_latent_patches_grad_streamed(vae, z.to(torch.float32), max_bs=1)   # [P,2,pt,ph,pw]
+        
+        x_patches = x_patches.to(torch.float32)
 
-        # global complex α per frame using only measured samples
-        num = (m_chunk_TcHW * y_meas_c_TcHW * k_est_c.conj()).sum(dim=(-2, -1))        # [pt]
-        den = (m_chunk_TcHW * (k_est_c.abs()**2)).sum(dim=(-2, -1)).clamp_min(eps)     # [pt]
-        alpha = num / den
-        if phase_only:
-            alpha = alpha / alpha.abs().clamp_min(eps)
-        k_est_c_aligned = alpha.view(-1, 1, 1) * k_est_c
+        # ---- depatchify to full chunk pixels (keeps grad) ----
+        x_full = depatchify(x_patches)       # [2, pt, H, W]; differentiable wrt z
+        # Align Tc if needed (as in your original)
+        _, pt_eff, H_eff, W_eff = x_full.shape
+        Tc = x_zf_TcHW.shape[0]
+        if pt_eff != Tc:
+            if Tc < pt_eff:
+                pad = pt_eff - Tc
+                x_zf = torch.cat([
+                    x_zf_TcHW,
+                    torch.zeros((pad, H_eff, W_eff), device=z.device, dtype=x_zf_TcHW.dtype)
+                ], dim=0)
+            else:
+                x_zf = x_zf_TcHW[:pt_eff]
+        else:
+            x_zf = x_zf_TcHW
 
-        # soft DC: blend measured lines with strength λ
-        k_corr_c = k_est_c_aligned * (1.0 - dc_lambda * m_chunk_TcHW) + (dc_lambda * y_meas_c_TcHW)
+        # ---- build predicted complex from real/imag ----
+        xr, xi = x_full[0], x_full[1]                         # [pt, H, W]
+        x_pred_c = torch.complex(xr, xi)                      # [pt, H, W]
 
-        # back to image
-        x_dc = torch.fft.ifft2(torch.fft.ifftshift(k_corr_c, dim=(-2, -1)), norm="ortho")
-        x_dc_full = torch.stack((x_dc.real, x_dc.imag), dim=0)                  # [2,pt,H,W]
+        # ---- LOSS in PIXEL space: || x_pred - x_zf ||_2^2 (masked ZF already) ----
+        # x_zf is complex [pt,H,W]
+        diff = x_pred_c - x_zf
+        L = (diff.real.pow(2) + diff.imag.pow(2)).mean()      # scalar; requires grad
 
-        # re-patchify and re-encode
-        dc_patches = spatial_patchify(x_dc_full)                                # [P,2,pt,ph,pw]
-        z_dc = encode_pixel_patches(vae, dc_patches, bs_vae)                    # [P,Cz,nt,H',W']
+        # ---- grad wrt z ----
+        (g,) = torch.autograd.grad(L, z, retain_graph=False, create_graph=False)  # [P,Cz,nt,H',W']
 
-        return (z_dc, x_dc_full) if return_pixel else z_dc
+        # ---- gradient step in latent space ----
+        # step_size shape: broadcastable to z
+        z_new = z - step_size[(...,) + (None,)*(z.ndim - step_size.ndim)] * g
+        return z_new
 
     # ---------- Euler(x0) with periodic DC ----------
     def sample_euler_x0_with_dc(
         net,
         noise: torch.Tensor,
         sigmas: torch.Tensor,
-        y_meas_c_full: torch.Tensor,   # [T,H,W] complex
-        m_full: torch.Tensor,          # [T,H,W] float
+        x_zf_full: torch.Tensor,     # [T,H,W] complex (pixel-space)
+        m_full: torch.Tensor,        # [T,H,W] float (centered k-space mask)
         t_start: int,
         Tc_valid: int,
         save_dir_for_chunk: str,
@@ -319,18 +388,34 @@ def run_validation_inv_once(
         B = x.shape[0]
         total = sigmas.numel() - 1
 
-        # slice measurements for this chunk, zero-pad tail
-        t_end_valid = min(t_start + Tc_valid, T)
-        y_meas_valid = y_meas_c_full[t_start:t_end_valid]                       # [Tc_valid,H,W]
-        m_valid = m_full[t_start:t_end_valid]                                   # [Tc_valid,H,W]
-        if Tc_valid < pt:
-            pad_c = torch.zeros((pt - Tc_valid, H, W), device=device, dtype=y_meas_valid.dtype)
-            pad_m = torch.zeros((pt - Tc_valid, H, W), device=device, dtype=m_valid.dtype)
-            y_meas_chunk = torch.cat([y_meas_valid, pad_c], dim=0)
-            m_chunk = torch.cat([m_valid, pad_m], dim=0)
+        # TeaCache init per chunk
+        tc_cfg = cfg.get("teacache", {})
+        tc_enable = bool(tc_cfg.get("enable", False))
+        tc_thresh = float(tc_cfg.get("rel_l1_thresh", 0.15))
+        tc_poly_file = tc_cfg.get("poly_file", None)
+        tc_coeffs = load_teacache_poly(tc_poly_file) if tc_enable else None
+        if tc_enable:
+            net.initialize_teacache(
+                enable_teacache=True,
+                num_steps=int(total),
+                rel_l1_thresh=tc_thresh,
+                poly_coeffs=tc_coeffs
+            )
         else:
-            y_meas_chunk = y_meas_valid
-            m_chunk = m_valid
+            net.initialize_teacache(enable_teacache=False)
+
+        # slice measurements/masks for this chunk (pad tail to pt)
+        t_end_valid = min(t_start + Tc_valid, T)
+        x_zf_valid = x_zf_full[t_start:t_end_valid]           # [Tc_valid,H,W] complex
+        m_valid     = m_full[t_start:t_end_valid]             # [Tc_valid,H,W] float
+        if Tc_valid < pt:
+            pad_c = torch.zeros((pt - Tc_valid, H, W), device=device, dtype=x_zf_valid.dtype)
+            pad_m = torch.zeros((pt - Tc_valid, H, W), device=device, dtype=m_valid.dtype)
+            x_zf_chunk = torch.cat([x_zf_valid, pad_c], dim=0)   # [pt,H,W] complex
+            m_chunk    = torch.cat([m_valid,     pad_m], dim=0)  # [pt,H,W] float
+        else:
+            x_zf_chunk = x_zf_valid
+            m_chunk    = m_valid
 
         center_mag_frames: List[np.ndarray] = []
         center_idx = min(max(Tc_valid // 2, 0), pt - 1)
@@ -338,54 +423,40 @@ def run_validation_inv_once(
         full_every = int(save_full_every) if do_full else 0
         dc_counter = 0
 
-        for i in range(total):
-            t = sigmas[i].expand(B)
+        for i in tqdm(range(total)):
+            t = sigmas[i].expand(B)      # fp32
             s = sigmas[i + 1].expand(B)
 
-            x_bf16 = x.to(torch.bfloat16)
-            t_bf16 = (t * float(t_scale)).to(torch.bfloat16)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                u = net(x_bf16, t_bf16)
-            u = u.to(torch.float32)
+            # model velocity (no grads wrt model)
+            with torch.no_grad():
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    u = net(x.to(torch.bfloat16), (t * float(t_scale)).to(torch.bfloat16))
+                u = u.to(torch.float32)
 
-            # x0 predictor
-            x0_pred = x - _append_dims(t, x.ndim) * u
+            # Euler(x0)-style predictor
+            x0_g_t = x - _append_dims(t, x.ndim) * u
+            x1_g_t = x + (1 - _append_dims(t, x.ndim)) * u
 
-            # do DC only every dc_every steps (and always at the last step)
-            do_dc_now = True
-            dc_lambda = 1.0
-            if do_dc_now and dc_lambda > 0.0:
-                if save_center_over_steps or do_full:
-                    z_dc, x_dc_full = dc_latent_from_x0(x0_pred, y_meas_chunk, m_chunk, return_pixel=True)
-                else:
-                    z_dc = dc_latent_from_x0(x0_pred, y_meas_chunk, m_chunk, return_pixel=False)
+            # --- periodic pixel-space DC (with grads wrt latent) ---
+            # per-patch step size: scale by |t - s| and dc_lambda
+            # t,s are shape [B] where B==P (patch batch)
+            step_sz = (t - s).abs() * dc_lambda         # [P]
+            x0_g_y = dc_latent_from_x0(x0_g_t, x_zf_chunk, m_chunk, step_sz)
 
-                # mix DC result with predictor in latent space (soft projection)
-                x0_used = (1.0 - dc_lambda) * x0_pred + dc_lambda * z_dc
-                dc_counter += 1
+            # (Optional logging: center magnitude frame over steps)
+            if save_center_over_steps:
+                with torch.no_grad():
+                    # decode -> depatchify (no grad needed here)
+                    px = decode_latent_patches(vae, x0_g_t, bs_vae)       # [P,2,pt,ph,pw]
+                    xf = depatchify(px)                                    # [2,pt,H,W]
+                    mag = torch.sqrt(torch.clamp(xf[0, center_idx]**2 + xf[1, center_idx]**2, min=0.0)).unsqueeze(0)
+                    center_mag_frames.append(frame_to_uint8(mag))
 
-                # logging (x0 after DC)
-                if save_center_over_steps:
-                    mag_c = torch.sqrt(torch.clamp(
-                        x_dc_full[0, center_idx]**2 + x_dc_full[1, center_idx]**2, min=0.0
-                    )).unsqueeze(0)
-                    center_mag_frames.append(frame_to_uint8(mag_c))
-                if do_full and ((dc_counter % full_every == 0) or (i == total - 1)):
-                    frames = []
-                    Tc = Tc_valid
-                    for tt in range(Tc):
-                        mag = torch.sqrt(torch.clamp(
-                            x_dc_full[0, tt]**2 + x_dc_full[1, tt]**2, min=0.0
-                        )).unsqueeze(0)
-                        frames.append(frame_to_uint8(mag))
-                    save_video_gray(frames, os.path.join(save_dir_for_chunk, f"chunk_t{t_start:04d}_step_{i:02d}.mp4"),
-                                    fps=int(cfg.get("logging", {}).get("latent_grid_fps", 7)))
-            else:
-                x0_used = x0_pred  # no DC this step
-
-            # Euler(x0) update
-            ratio = _append_dims((s / t.clamp_min(1e-8)), x.ndim)
-            x = ratio * x + (1.0 - ratio) * x0_used
+            # combine (same as your earlier xt0/xt1 mix)
+            xt0_g_t = _append_dims(t, x.ndim) * x0_g_y + (1 - _append_dims(t, x.ndim)) * x0_g_t
+            xt1_g_t = torch.sqrt(_append_dims(s, x.ndim)) * x1_g_t + torch.sqrt((1 - _append_dims(s, x.ndim))) * torch.randn_like(x)
+            x = (1 - _append_dims(s, x.ndim)) * xt0_g_t + _append_dims(s, x.ndim) * xt1_g_t
+            x = x.detach()  # avoid graph growth across steps
 
         if save_center_over_steps and len(center_mag_frames) > 0:
             save_video_gray(center_mag_frames,
@@ -412,7 +483,7 @@ def run_validation_inv_once(
         noise = torch.randn((P, Cz, nt, Hlat, Wlat), generator=g, device=device, dtype=torch.float32)
         z_x0 = sample_euler_x0_with_dc(
             model, noise, sigmas,
-            y_meas_c_full=k_meas_c_full, m_full=m_full_THW,
+            x_zf_full=x_zf_full, m_full=m_full_THW,
             t_start=t0, Tc_valid=Tc_valid,
             save_dir_for_chunk=inter_dir,
         )  # [P,Cz,nt,Hlat,Wlat]
@@ -501,6 +572,22 @@ def run_uncond_debug_once(
     # --- linear schedule 1→0 (inclusive), fp32 state ---
     sigmas = torch.linspace(1.0, 0.0, steps=steps + 1, device=device, dtype=torch.float32)
 
+    tc_cfg = cfg.get("teacache", {})
+    tc_enable = bool(tc_cfg.get("enable", False))
+    tc_thresh = float(tc_cfg.get("rel_l1_thresh", 0.15))
+    tc_poly_file = tc_cfg.get("poly_file", None)
+    tc_coeffs = _load_teacache_poly(tc_poly_file) if tc_enable else None
+
+    if tc_enable:
+        model.initialize_teacache(
+            enable_teacache=True,
+            num_steps=int(steps),
+            rel_l1_thresh=tc_thresh,
+            poly_coeffs=tc_coeffs
+        )
+    else:
+        model.initialize_teacache(enable_teacache=False)
+
     # quick sanity prints (match training)
     if P == 0:
         raise RuntimeError("No spatial tiles computed.")
@@ -549,15 +636,14 @@ def run_uncond_debug_once(
 
 
 # ---------- main ----------
-@torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default='configs/flow_matching.yaml')
-    ap.add_argument("--ckpt", type=str, default='/storage/matt_models/latent_fm/flowmatch/step_0100000/state.pt', help="FM checkpoint with model/ema states")
+    ap.add_argument("--ckpt", type=str, default='/storage/matt_models/latent_fm/flowmatch/step_0380000/state.pt', help="FM checkpoint with model/ema states")
     ap.add_argument("--use-ema", type=str, default="raw", choices=["raw", "ema", "both"],
                     help="Which weights to test")
     ap.add_argument("--video-index", type=int, default=0, help="Deterministic val sample index")
-    ap.add_argument("--R", type=int, default=4, help="Acceleration factor")
+    ap.add_argument("--R", type=int, default=8, help="Acceleration factor")
     ap.add_argument("--outdir", type=str, default="./_test_inv_out")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
@@ -631,15 +717,6 @@ def main():
                 z_mu = z_mu.squeeze(0)
             Cz, nt, Hlat, Wlat = int(z_mu.shape[0]), int(z_mu.shape[1]), int(z_mu.shape[2]), int(z_mu.shape[3])
 
-        # --- materialize `final` via a tiny dummy forward (matches training's bf16 autocast) ---
-        with torch.no_grad():
-            x_d = torch.zeros(1, Cz, nt, Hlat, Wlat, device=device, dtype=torch.bfloat16)
-            # any t works; training scales times by t_scale, so just hand it something nonzero
-            t_scale = float(cfg.get("sampler", {}).get("t_scale", 1000.0))
-            t_d = torch.ones(1, device=device, dtype=torch.bfloat16) * t_scale
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                _ = m(x_d, t_d)   # this builds m.final on the right device
-
         # --- now strict load is safe (final.* exists) ---
         ckpt_path = args.ckpt or cfg["model"].get("load_state_dict_from", None)
         if not ckpt_path or not os.path.isfile(ckpt_path):
@@ -659,13 +736,15 @@ def main():
         m.to(torch.bfloat16).eval()
         for p in m.parameters():
             p.requires_grad_(False)
+
+        m = torch.compile(m)
         return m
 
     do_raw = args.use_ema in ("raw", "both")
     do_ema = args.use_ema in ("ema", "both")
 
     model_raw = load_model_from_ckpt("raw", vae)
-    _ = run_uncond_debug_once(model_raw, vae, x_true, cfg, outdir=args.outdir, tag="raw")
+    # _ = run_uncond_debug_once(model_raw, vae, x_true, cfg, outdir=args.outdir, tag="raw")
     recon_raw = run_validation_inv_once(
         model_raw, vae, x_true, cfg,
         use_linear_sigmas=True, t_scale=float(cfg.get("sampler", {}).get("t_scale", 1000.0)),

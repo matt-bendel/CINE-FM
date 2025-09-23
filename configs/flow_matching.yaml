@@ -57,6 +57,9 @@ optim:
   grad_clip: 1.0
   total_steps: 400000
   ema_decay: 0.999
+  scheduler:
+    type: cosine
+    eta_min_ratio: 0.1  # final lr = lr * eta_min_ratio
 
 validation:
   patch_h: 80
@@ -78,3 +81,7 @@ logging:
   wandb_dir: /storage/matt_models/wandb   # NEW (optional)
   wandb_cache_dir: /storage/matt_models/wandbcache  # NEW (optional)
 
+teacache:
+  enable: false         # or false
+  rel_l1_thresh: 0.14  # start around [0.10, 0.15], per your fit script’s printout
+  poly_file: teacache_poly.json

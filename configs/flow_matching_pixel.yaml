@@ -1,0 +1,85 @@
+train_dataset:
+  name: CINEPixelDataset
+  args:
+    root: /storage/CINE_data
+    split: train
+    fixed_train_L: 8          # 8 frames for training (even OK)
+    crop_h: 64
+    crop_w: 64
+    normalize: percentile
+    seed: 123
+    t_choices: [8]
+
+val_dataset:
+  name: CINEPixelDataset
+  args:
+    root: /storage/CINE_data
+    split: val
+    normalize: percentile
+    seed: 123
+
+dataloader:
+  train_batch_size: 2         # pixel batches (you can tune)
+  val_batch_size: 1
+  num_workers: 8
+  pin_memory: false
+  shuffle: true
+
+# No VAE block anymore (fully pixel-space)
+
+model:
+  import_path: CardiacFM.model.transformer_pixel    # <-- your pixel-space FM model module
+  class_name: FlowMatchTransformer              # <-- pixel model class
+  args:
+    latent_channels: 2
+    hidden_size: 1200
+    depth: 40
+    heads: 24
+    mlp_ratio: 4.0
+    patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
+  # load_state_dict_from: /storage/matt_models/latent_fm/flowmatch_pixels/step_0020000/state.pt
+  load_state_dict_from: none
+  strict_load: false
+  resume: false
+
+optim:
+  lr: 0.0002
+  betas: [0.9, 0.99]
+  weight_decay: 0.01
+  grad_clip: 1.0
+  total_steps: 500000
+  ema_decay: 0.999
+  accum_steps: 2
+  scheduler:
+    type: cosine
+    eta_min_ratio: 0.1
+
+validation:
+  # pixel-space patchify parameters for reconstruction (and inverse sampling)
+  patch_h: 64
+  patch_w: 64
+  patch_t: 8
+  overlap_spatial_pct: 1.0     # NEW: tunable overlap in %
+
+sampler:
+  num_steps: 50
+  variant: bh1
+  shift: 3.0                   # or use your flux mapping; this is fine
+
+logging:
+  project: cardiac-lfm
+  run_name: fm_pixels_64x64x8
+  log_every_steps: 100
+  val_every_steps: 20000
+  save_every_steps: 20000
+  out_dir: /storage/matt_models/latent_fm
+  wandb_dir: /storage/matt_models/wandb
+  wandb_cache_dir: /storage/matt_models/wandbcache
+
+teacache:
+  enable: false
+  rel_l1_thresh: 0.14
+  poly_file: teacache_poly.json
+
+deg:
+  R: 8   # GRO R used for ZF target

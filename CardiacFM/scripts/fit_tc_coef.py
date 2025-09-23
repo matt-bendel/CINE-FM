@@ -48,7 +48,7 @@ def forward_vel(model: LatentFlowMatchTransformer, zt: torch.Tensor, t: torch.Te
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt', type=str, default='/storage/matt_models/latent_fm/flowmatch/step_0100000/state.pt', help='path to torch ckpt or "none"')
+    p.add_argument('--ckpt', type=str, default='/storage/matt_models/latent_fm/flowmatch/step_0300000/state.pt', help='path to torch ckpt or "none"')
     p.add_argument('--latent-ch', type=int, default=16)
     p.add_argument('--n', type=int, default=4)
     p.add_argument('--H', type=int, default=40)
