@@ -59,7 +59,7 @@ class CINEPixelDataset(torch.utils.data.Dataset):
         assert self.normalize in ("qmag", "unitmax", "percentile", "none")
         self.norm_q = float(norm_q)
         self.norm_target = float(norm_target)
-        self.norm_max_gain = float(norm_max_gain)
+        self.norm_max_gain = (None if norm_max_gain in (None, "none") else float(norm_max_gain))
 
         # files
         split_dir = os.path.join(root, split)
