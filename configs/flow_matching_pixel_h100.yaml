@@ -1,31 +1,31 @@
+# configs/flow_matching_pixel_h100_shards.yaml
+
 train_dataset:
   name: CINEPixelDataset
   args:
-    data_path: /users/PAS2812/mattbendel/CINE_data/train.pkl  # <- memory-mapped pickle
-    t_frames: 8
-    crop_hw: [64, 64]
-    std_scale: 1.5
-    apply_preproc: true
-    log_stats: true
+    root: /users/PAS2812/mattbendel/CINE_data
+    split: train
+    t_frame: 8
+    t_H: 64
+    t_W: 64
+    std_scale_top: 1.5     # matches colleague’s sampling
+    std_scale_left: 1.5
+    seed: 123
 
 val_dataset:
   name: CINEPixelDataset
   args:
-    data_path: /users/PAS2812/mattbendel/CINE_data/val.pkl
-    t_frames: 8
-    crop_hw: [64, 64]
-    std_scale: 1.5
-    apply_preproc: true
-    log_stats: false
+    root: /users/PAS2812/mattbendel/CINE_data
+    split: val
+    # val returns full [2,T,H,W]; same class, no extra args
 
 dataloader:
   train_batch_size: 4
   val_batch_size: 1
   num_workers: 8
-  pin_memory: false
+  pin_memory: true
   shuffle: true
 
-# Model is your pixel-space FM network
 model:
   import_path: CardiacFM.model.transformer_pixel
   class_name: FlowMatchTransformer
@@ -36,7 +36,7 @@ model:
     heads: 12
     mlp_ratio: 4.0
     patch_size: [1, 2, 2]
-    rope_axes_dim: [16, 28, 28]
+    rope_axes_dim: [8, 32, 32]
   load_state_dict_from: none
   strict_load: false
   resume: false
@@ -57,29 +57,42 @@ validation:
   patch_h: 64
   patch_w: 64
   patch_t: 8
+  patch_batch: 64
   overlap_spatial_pct: 1.0
   num_uncond_videos: 8
-  latent_grid_fps: 7
-  # For inverse/DC path (kept here for later use)
-  dc_lambda: 0.3
+  grid_rows: 2
+  grid_cols: 4
   dc_every: 4
   dc_step_size: 5.0
+  dc_lambda: 0.3
 
 sampler:
   num_steps: 50
-  t_scale: 1000        # <-- kept at 1000 as requested
-  # optional extras if you later add reparam variants
+  variant: bh1
+  shift: 3.0
+  t_scale: 1000
   sigma_exponent: 1.0
+  x1: 256
+  x2: 4096
+  y1: 0.5
+  y2: 1.15
+  exp_max: 7.0
 
 logging:
   project: cardiac-lfm
-  run_name: fm_pixels_64x64x8
+  run_name: fm_pixels_64x64x8_shards_no_norm
   log_every_steps: 100
   val_every_steps: 1000
   save_every_steps: 20000
   out_dir: /users/PAS2812/mattbendel/latent_fm
   wandb_dir: /users/PAS2812/mattbendel/wandb
   wandb_cache_dir: /users/PAS2812/mattbendel/wandbcache
+  latent_grid_fps: 7
+
+teacache:
+  enable: false
+  rel_l1_thresh: 0.14
+  poly_file: teacache_poly.json
 
 deg:
   R: 8

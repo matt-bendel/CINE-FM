@@ -1,132 +1,175 @@
 # data/cine_dataset_pixel.py
-import os, mmap, pickle, random
-from typing import Tuple
+import os, glob, h5py, random
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
-import scipy.stats as stats
+from typing import List, Tuple, Dict, Optional
 
-def _complex_gamma_correction_flat(z_flat: np.ndarray, gamma: float = 0.1) -> np.ndarray:
-    """Apply gamma to magnitudes >= 1, preserve phase. z_flat is complex1d."""
-    phase = np.angle(z_flat)
-    mag   = np.abs(z_flat)
-    mask  = (mag >= 1.0)
-    mag[mask] = mag[mask] ** gamma
-    return mag * np.exp(1j * phase)
-
-def preprocess_complex_2thw(x_2thw: torch.Tensor,
-                            gamma: float = 0.1,
-                            scale: float = 0.2,
-                            final_div: float = 1.15) -> torch.Tensor:
+class CINEPixelDataset(torch.utils.data.Dataset):
     """
-    Mirror colleague’s normalization:
-      1) multiply by 0.2
-      2) complex gamma correction (γ=0.1) on magnitudes >=1
-      3) divide by fixed max ~1.15
-    """
-    device = x_2thw.device
-    dtype  = x_2thw.dtype
-    r = x_2thw[0].cpu().numpy()
-    i = x_2thw[1].cpu().numpy()
-    z = (r + 1j * i) * scale
-    zf = z.reshape(-1)
-    zf = _complex_gamma_correction_flat(zf, gamma=gamma)
-    z  = zf.reshape(z.shape) / final_div
-    out = np.stack([np.real(z), np.imag(z)], axis=0)  # [2,T,H,W]
-    return torch.from_numpy(out).to(device=device, dtype=dtype)
+    Pixel-space CINE MRI dataset that mirrors your colleague's PKL loader,
+    but sources samples from HDF5 shards.
 
-class CINEPixelDataset(Dataset):
-    """
-    Loads a memory-mapped pickle list of arrays/tensors shaped [2, T_full, H_full, W_full]
-    and yields fixed-size clips [2, 8, 64, 64] with colleague-matched preprocessing.
-    """
-    def __init__(self,
-                 data_path: str,
-                 t_frames: int = 8,
-                 crop_hw: Tuple[int, int] = (64, 64),
-                 std_scale: float = 1.5,
-                 apply_preproc: bool = True,
-                 log_stats: bool = True):
-        assert os.path.isfile(data_path), f"File not found: {data_path}"
-        with open(data_path, "rb") as f:
-            mm = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
-            self.data_list = pickle.loads(mm)
-            mm.close()
+    Train:
+      • Returns [2, 8, 64, 64]
+        - time: random circular 8-frame window
+        - space: truncnorm-centered crop with horizontal "roll" (circular) on W, then crop
+        - flips: random horizontal and vertical
+      • NO normalization (values are used as-is).
 
-        self.t_frames = int(t_frames)
-        self.t_H, self.t_W = int(crop_hw[0]), int(crop_hw[1])
-        self.std_scale = float(std_scale)
-        self.apply_preproc = bool(apply_preproc)
+    Val/Test:
+      • Returns full volume [2, T, H, W] (no crop, no norm).
+    """
 
-        if log_stats and len(self.data_list) > 0:
-            # Peek stats (without loading everything to GPU)
-            mx, mn = -1e9, 1e9
-            sample_shape = None
-            for i in range(min(len(self.data_list), 64)):
-                arr = self.data_list[i]
-                if not isinstance(arr, torch.Tensor):
-                    arr = torch.tensor(arr, dtype=torch.float32)
-                mx = max(mx, float(arr.max()))
-                mn = min(mn, float(arr.min()))
-                sample_shape = tuple(arr.shape)
-            print(f"[CINEPixelDataset] loaded={len(self.data_list)} sample_shape={sample_shape} "
-                  f"min={mn:.6f} max={mx:.6f}")
-            print("[CINEPixelDataset] using truncated-Gaussian spatial crops + circular roll + flips")
-            print(f"[CINEPixelDataset] output fixed shape: (2, {self.t_frames}, {self.t_H}, {self.t_W})")
+    # --------------------- init ---------------------
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",     # "train" | "val" | "test"
+        # training geometry (match colleague)
+        t_frame: int = 8,
+        t_H: int = 64,
+        t_W: int = 64,
+        # truncnorm concentration (match colleague defaults)
+        std_scale_top: float = 1.5,   # used as *0.5* on top_std like colleague's code
+        std_scale_left: float = 1.5,
+        seed: int = 123,
+        **kwargs,                    # ignore any extra keys
+    ):
+        assert split in ("train", "val", "test")
+        self.root = root
+        self.split = split
+
+        # train geometry
+        self.t_frame = int(t_frame)
+        self.t_H = int(t_H)
+        self.t_W = int(t_W)
+
+        # truncnorm scales
+        self.std_scale_top = float(std_scale_top)
+        self.std_scale_left = float(std_scale_left)
+
+        # discover shards
+        split_dir = os.path.join(root, split)
+        shards_dir = os.path.join(split_dir, "shards")
+        if not os.path.isdir(shards_dir):
+            raise FileNotFoundError(f"Expected shards at {shards_dir}")
+
+        self._samples: List[Tuple[str, str]] = []
+        for sp in sorted(glob.glob(os.path.join(shards_dir, "*.h5"))):
+            try:
+                with h5py.File(sp, "r", libver="latest") as hf:
+                    if "volumes" not in hf:
+                        continue
+                    for key in hf["volumes"].keys():
+                        # each item expected shape [2, T, H, W]
+                        self._samples.append((sp, key))
+            except Exception as e:
+                print(f"[CINEPixelDataset] Skipping shard {sp}: {e}")
+
+        if not self._samples:
+            raise RuntimeError(f"No 'volumes/*' datasets found under {shards_dir}")
+
+        self.rng = random.Random(seed)
+        self._h5_cache: Dict[str, h5py.File] = {}
 
     def __len__(self):
-        return len(self.data_list)
+        return len(self._samples)
 
-    def _truncnorm_coords(self, H: int, W: int):
-        # Match colleague’s sampling bias (center-favoring)
-        top_mean = (H - self.t_H) / 2.0
-        top_std  = (H - self.t_H) / 6.0 * (self.std_scale / 2.0)
-        top_a, top_b = 0, H - self.t_H
+    # --------------------- HDF5 helpers ---------------------
+    def _get_file(self, path: str) -> h5py.File:
+        f = self._h5_cache.get(path)
+        if f is None:
+            f = h5py.File(path, "r", libver="latest", swmr=True)
+            self._h5_cache[path] = f
+        return f
 
-        left_mean = (W - self.t_W) / 2.0
-        left_std  = (W - self.t_W) / 6.0 * self.std_scale
-        left_a, left_b = -(self.t_W - 1), W - 1  # allow negative for circular roll
-
-        top = stats.truncnorm((top_a - top_mean) / (top_std + 1e-8),
-                              (top_b - top_mean) / (top_std + 1e-8),
-                              loc=top_mean, scale=top_std + 1e-8).rvs()
-        left = stats.truncnorm((left_a - left_mean) / (left_std + 1e-8),
-                               (left_b - left_mean) / (left_std + 1e-8),
-                               loc=left_mean, scale=left_std + 1e-8).rvs()
-        return int(top), int(left)
-
-    def __getitem__(self, idx):
-        x = self.data_list[idx]
-        if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32)
-
-        # x: [2, T_full, H_full, W_full]
-        _, T, H, W = x.shape
-
-        # 1) Temporal circular crop to exactly 8 frames
-        start = random.randint(0, max(0, T - self.t_frames))
-        idxs  = [(start + i) % T for i in range(self.t_frames)]
-        x = x[:, idxs, :, :]  # [2, 8, H, W]
-
-        # 2) Spatial: circular horizontal roll then crop (top, 0) with width 64
-        top, left = self._truncnorm_coords(H, W)
-        x = torch.roll(x, shifts=-left, dims=-1)          # circular shift along width
-        x = TF.crop(x, top, 0, self.t_H, self.t_W)        # crop to (64,64)
-
-        # 3) Random flips
-        if random.random() > 0.5:
-            x = torch.flip(x, dims=[-1])
-        if random.random() > 0.5:
-            x = torch.flip(x, dims=[-2])
-
-        # 4) Colleague-matched preprocessing (scale→gamma→fixed max)
-        if self.apply_preproc:
-            x = preprocess_complex_2thw(x, gamma=0.1, scale=0.2, final_div=1.15)
-
-        # Final guard
-        assert x.shape == (2, self.t_frames, self.t_H, self.t_W), f"Got {tuple(x.shape)}"
+    def _load_volume(self, shard_path: str, key: str) -> torch.Tensor:
+        hf = self._get_file(shard_path)
+        arr = hf["volumes"][key][()]  # numpy array, [2, T, H, W]
+        if not isinstance(arr, np.ndarray):
+            arr = np.asarray(arr)
+        x = torch.from_numpy(arr).float()
+        # DO NOT normalize; DO NOT clamp (match colleague)
         return x
 
-    def getshapes(self):
-        return (len(self.data_list), 2, self.t_frames, self.t_H, self.t_W)
+    # --------------------- truncnorm sampler (no SciPy) ---------------------
+    @staticmethod
+    def _truncnorm_int(mean: float, std: float, a: float, b: float, rng: random.Random) -> int:
+        """Simple rejection sampler for truncated normal, returns int."""
+        if std <= 1e-8:
+            return int(round(max(a, min(b, mean))))
+        # a few tries is fine for our bounds
+        for _ in range(100):
+            z = rng.gauss(0.0, 1.0)
+            v = mean + std * z
+            if a <= v <= b:
+                return int(v)
+        # fallback to clamped mean if rejection failed
+        return int(round(max(a, min(b, mean))))
+
+    def _sample_top_left(self, H: int, W: int) -> Tuple[int, int]:
+        # --- top ---
+        # colleague: top_mean = (H - t_H)/2 ; top_std = (H - t_H)/6 ; *= (std_scale/2)
+        top_mean = (H - self.t_H) / 2.0
+        top_std = (H - self.t_H) / 6.0 * (self.std_scale_top / 2.0)
+        top_a, top_b = 0.0, float(max(0, H - self.t_H))
+        top = self._truncnorm_int(top_mean, max(1e-6, top_std), top_a, top_b, self.rng)
+
+        # --- left ---
+        # colleague: left_mean = (W - t_W)/2 ; left_std = (W - t_W)/6 ; *= std_scale
+        # bounds: a = -(t_W - 1), b = W - 1  (circular roll then crop at x=0)
+        left_mean = (W - self.t_W) / 2.0
+        left_std = (W - self.t_W) / 6.0 * self.std_scale_left
+        left_a, left_b = float(-(self.t_W - 1)), float(W - 1)
+        left = self._truncnorm_int(left_mean, max(1e-6, left_std), left_a, left_b, self.rng)
+
+        return int(top), int(left)
+
+    # --------------------- dataset API ---------------------
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        shard_path, key = self._samples[idx]
+        vol = self._load_volume(shard_path, key)   # [2, T, H, W]
+
+        if self.split == "train":
+            # ----- time: random circular crop to length 8 -----
+            _, T, H, W = vol.shape
+            t0 = self.rng.randint(0, max(0, T - self.t_frame))
+            idxs = [ (t0 + i) % T for i in range(self.t_frame) ]
+            clip = vol[:, idxs, :, :]  # [2, 8, H, W]
+
+            # ----- space: roll + truncnorm-centered crop to 64x64 -----
+            top, left = self._sample_top_left(H, W)
+            # circular roll along W by -left (match colleague)
+            clip = torch.roll(clip, shifts=-left, dims=-1)
+            # then crop at (top, 0)
+            clip = TF.crop(clip, top, 0, self.t_H, self.t_W)  # [2, 8, 64, 64]
+
+            # random flips
+            if self.rng.random() > 0.5:
+                clip = torch.flip(clip, dims=[-1])  # horizontal
+            if self.rng.random() > 0.5:
+                clip = torch.flip(clip, dims=[-2])  # vertical
+
+            # final assert (useful if source sizes vary)
+            assert clip.shape == (2, self.t_frame, self.t_H, self.t_W), \
+                f"Got {clip.shape}, expected (2,{self.t_frame},{self.t_H},{self.t_W})"
+            return clip
+
+        # val/test: return full volume (no crop, no norm)
+        return vol.contiguous()
+
+    # --------------------- cleanup ---------------------
+    def close(self):
+        for p, f in list(self._h5_cache.items()):
+            try:
+                f.close()
+            except:
+                pass
+        self._h5_cache.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except:
+            pass
