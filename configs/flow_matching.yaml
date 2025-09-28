@@ -12,7 +12,7 @@ val_dataset:
     normalize: qmag
 
 dataloader:
-  train_batch_size: 12     # each item yields a list of clips; we flatten across the batch
+  train_batch_size: 8     # each item yields a list of clips; we flatten across the batch
   val_batch_size: 1
   num_workers: 8
   pin_memory: false
@@ -54,7 +54,7 @@ optim:
   betas: [0.9, 0.99]
   weight_decay: 0.01
   grad_clip: 1.0
-  total_steps: 400000
+  total_steps: 1000000
   ema_decay: 0.999
   scheduler:
     type: cosine
