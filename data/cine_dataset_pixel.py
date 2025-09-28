@@ -1,228 +1,132 @@
-# data/cine_pixel_dataset.py
-import os, json, h5py, torch, random
+# data/cine_dataset_pixel.py
+import os, mmap, pickle, random
+from typing import Tuple
 import numpy as np
-import torch.nn.functional as F
-from typing import List, Tuple, Dict, Optional
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms.functional as TF
+import scipy.stats as stats
 
-class CINEPixelDataset(torch.utils.data.Dataset):
+def _complex_gamma_correction_flat(z_flat: np.ndarray, gamma: float = 0.1) -> np.ndarray:
+    """Apply gamma to magnitudes >= 1, preserve phase. z_flat is complex1d."""
+    phase = np.angle(z_flat)
+    mag   = np.abs(z_flat)
+    mask  = (mag >= 1.0)
+    mag[mask] = mag[mask] ** gamma
+    return mag * np.exp(1j * phase)
+
+def preprocess_complex_2thw(x_2thw: torch.Tensor,
+                            gamma: float = 0.1,
+                            scale: float = 0.2,
+                            final_div: float = 1.15) -> torch.Tensor:
     """
-    Pixel-space CINE MRI dataset (no VAE), single mode = videos.
-
-    • Train:
-        - returns [2, L, 64, 64]
-          L defaults to 8 (even allowed). If fixed_train_L is None, a value
-          is drawn from t_choices.
-
-    • Val/Test:
-        - returns full volume [2, T_odd, H, W] after GLOBAL q-mag normalization
-          (drops last frame if T is even).
+    Mirror colleague’s normalization:
+      1) multiply by 0.2
+      2) complex gamma correction (γ=0.1) on magnitudes >=1
+      3) divide by fixed max ~1.15
     """
+    device = x_2thw.device
+    dtype  = x_2thw.dtype
+    r = x_2thw[0].cpu().numpy()
+    i = x_2thw[1].cpu().numpy()
+    z = (r + 1j * i) * scale
+    zf = z.reshape(-1)
+    zf = _complex_gamma_correction_flat(zf, gamma=gamma)
+    z  = zf.reshape(z.shape) / final_div
+    out = np.stack([np.real(z), np.imag(z)], axis=0)  # [2,T,H,W]
+    return torch.from_numpy(out).to(device=device, dtype=dtype)
 
-    def __init__(
-        self,
-        root: str,
-        split: str = "train",              # "train" | "val" | "test"
-        # temporal behavior (EVEN length allowed; default 8)
-        fixed_train_L: Optional[int] = 8,
-        t_choices: Optional[List[int]] = None,   # used only if fixed_train_L is None
-        # spatial crop config (train only)
-        crop_h: int = 80,
-        crop_w: int = 80,
-        # normalization
-        normalize: str = "qmag",           # "qmag" or "none"
-        norm_q: float = 0.995,
-        norm_target: float = 0.98,
-        norm_max_gain: float = None,
-        # misc
-        seed: int = 123,
-        **kwargs,
-    ):
-        assert split in ("train", "val", "test")
-        self.root  = root
-        self.split = split
+class CINEPixelDataset(Dataset):
+    """
+    Loads a memory-mapped pickle list of arrays/tensors shaped [2, T_full, H_full, W_full]
+    and yields fixed-size clips [2, 8, 64, 64] with colleague-matched preprocessing.
+    """
+    def __init__(self,
+                 data_path: str,
+                 t_frames: int = 8,
+                 crop_hw: Tuple[int, int] = (64, 64),
+                 std_scale: float = 1.5,
+                 apply_preproc: bool = True,
+                 log_stats: bool = True):
+        assert os.path.isfile(data_path), f"File not found: {data_path}"
+        with open(data_path, "rb") as f:
+            mm = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
+            self.data_list = pickle.loads(mm)
+            mm.close()
 
-        # temporal selection
-        self.fixed_train_L = fixed_train_L
-        if (self.fixed_train_L is not None) and (self.fixed_train_L < 1):
-            raise ValueError("fixed_train_L must be >= 1 if provided.")
-        if t_choices is None:
-            t_choices = [4, 6, 8, 10, 12]
-        self.t_choices = [int(t) for t in t_choices if t >= 1]
-        assert len(self.t_choices) > 0, "t_choices must include lengths >= 1"
+        self.t_frames = int(t_frames)
+        self.t_H, self.t_W = int(crop_hw[0]), int(crop_hw[1])
+        self.std_scale = float(std_scale)
+        self.apply_preproc = bool(apply_preproc)
 
-        # crop sizes (train only)
-        self.crop_h = int(crop_h)
-        self.crop_w = int(crop_w)
-
-        # normalization
-        self.normalize = str(normalize).lower()
-        assert self.normalize in ("qmag", "unitmax", "percentile", "none")
-        self.norm_q = float(norm_q)
-        self.norm_target = float(norm_target)
-        self.norm_max_gain = (None if norm_max_gain in (None, "none") else float(norm_max_gain))
-
-        # files
-        split_dir = os.path.join(root, split)
-        shards_dir = os.path.join(split_dir, "shards")
-        meta_path  = os.path.join(split_dir, "split_meta.json")
-        if not os.path.isfile(meta_path):
-            raise FileNotFoundError(f"split_meta.json not found at {meta_path}")
-        with open(meta_path, "r") as f:
-            self.meta = json.load(f)
-
-        self._samples: List[Tuple[str, str]] = []
-        for shard in sorted(os.listdir(shards_dir)):
-            if not shard.endswith(".h5"): continue
-            sp = os.path.join(shards_dir, shard)
-            with h5py.File(sp, "r", libver="latest") as hf:
-                if "volumes" not in hf: continue
-                for key in hf["volumes"].keys():
-                    self._samples.append((sp, key))
-        if not self._samples:
-            raise RuntimeError(f"No samples under {shards_dir}")
-
-        self.rng = random.Random(seed)
-        self._h5_cache: Dict[str, h5py.File] = {}
+        if log_stats and len(self.data_list) > 0:
+            # Peek stats (without loading everything to GPU)
+            mx, mn = -1e9, 1e9
+            sample_shape = None
+            for i in range(min(len(self.data_list), 64)):
+                arr = self.data_list[i]
+                if not isinstance(arr, torch.Tensor):
+                    arr = torch.tensor(arr, dtype=torch.float32)
+                mx = max(mx, float(arr.max()))
+                mn = min(mn, float(arr.min()))
+                sample_shape = tuple(arr.shape)
+            print(f"[CINEPixelDataset] loaded={len(self.data_list)} sample_shape={sample_shape} "
+                  f"min={mn:.6f} max={mx:.6f}")
+            print("[CINEPixelDataset] using truncated-Gaussian spatial crops + circular roll + flips")
+            print(f"[CINEPixelDataset] output fixed shape: (2, {self.t_frames}, {self.t_H}, {self.t_W})")
 
     def __len__(self):
-        return len(self._samples)
+        return len(self.data_list)
 
-    # ---------- I/O + normalization (GLOBAL per volume) ----------
-    def _get_file(self, path: str) -> h5py.File:
-        f = self._h5_cache.get(path)
-        if f is None:
-            f = h5py.File(path, "r", libver="latest", swmr=True)
-            self._h5_cache[path] = f
-        return f
+    def _truncnorm_coords(self, H: int, W: int):
+        # Match colleague’s sampling bias (center-favoring)
+        top_mean = (H - self.t_H) / 2.0
+        top_std  = (H - self.t_H) / 6.0 * (self.std_scale / 2.0)
+        top_a, top_b = 0, H - self.t_H
 
-    def _load_volume(self, shard_path, group_name) -> torch.Tensor:
-        hf = self._get_file(shard_path)
-        vol = torch.from_numpy(hf["volumes"][group_name][()]).float()  # [2, T, H, W] in [-1, 1]
-        vol.clamp_(-1, 1)
-        if self.normalize == "qmag":
-            vol = self._robust_norm_qmag_global(vol)
-        elif self.normalize == "unitmax":
-            vol = self._unitmax_global(vol)
-        elif self.normalize == "percentile":
-            vol = self._norm_per_volume_percentile(vol)
-        return vol
+        left_mean = (W - self.t_W) / 2.0
+        left_std  = (W - self.t_W) / 6.0 * self.std_scale
+        left_a, left_b = -(self.t_W - 1), W - 1  # allow negative for circular roll
 
-    def _unitmax_global(self, vol: torch.Tensor) -> torch.Tensor:
-        """
-        Per-volume gain so that max(|vol|) == 1.0.
-        Never up-scales beyond 1 if data already in [-1, 1].
-        """
-        max_abs = vol.abs().amax()
-        if not torch.isfinite(max_abs) or max_abs <= 0:
-            return vol
-        gain = min(1.0 / max_abs.item(), 1.0)  # don't boost above 1
-        return (vol * gain).clamp_(-1.0, 1.0)
+        top = stats.truncnorm((top_a - top_mean) / (top_std + 1e-8),
+                              (top_b - top_mean) / (top_std + 1e-8),
+                              loc=top_mean, scale=top_std + 1e-8).rvs()
+        left = stats.truncnorm((left_a - left_mean) / (left_std + 1e-8),
+                               (left_b - left_mean) / (left_std + 1e-8),
+                               loc=left_mean, scale=left_std + 1e-8).rvs()
+        return int(top), int(left)
 
-    def _norm_per_volume_percentile(self, vol: torch.Tensor) -> torch.Tensor:
-        """
-        Per-volume complex gain based on a high percentile of magnitude.
-        One scalar 'gain' applied to both channels; no shifts; then hard-clip to [-1,1].
-        """
-        # magnitude over the whole volume
-        mag = torch.sqrt(vol[0].pow(2) + vol[1].pow(2))       # [T,H,W]
-        flat = mag.reshape(-1)
-        hi = torch.quantile(flat, self.norm_q)
-        if not torch.isfinite(hi) or hi <= 1e-8:
-            return vol
+    def __getitem__(self, idx):
+        x = self.data_list[idx]
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, dtype=torch.float32)
 
-        # desired: hi -> norm_target
-        gain = self.norm_target / float(hi)
+        # x: [2, T_full, H_full, W_full]
+        _, T, H, W = x.shape
 
-        # optional safety cap (disabled by default)
-        if self.norm_max_gain is not None:
-            gain = min(gain, float(self.norm_max_gain))
+        # 1) Temporal circular crop to exactly 8 frames
+        start = random.randint(0, max(0, T - self.t_frames))
+        idxs  = [(start + i) % T for i in range(self.t_frames)]
+        x = x[:, idxs, :, :]  # [2, 8, H, W]
 
-        # also guarantee we never exceed [-1,1] due to outliers after scaling
-        max_abs = vol.abs().amax()
-        if max_abs > 0:
-            gain_clip = 1.0 / float(max_abs)
-            gain = min(gain, gain_clip)
+        # 2) Spatial: circular horizontal roll then crop (top, 0) with width 64
+        top, left = self._truncnorm_coords(H, W)
+        x = torch.roll(x, shifts=-left, dims=-1)          # circular shift along width
+        x = TF.crop(x, top, 0, self.t_H, self.t_W)        # crop to (64,64)
 
-        vol = vol * gain
-        vol.clamp_(-1.0, 1.0)   # hard clamp
-        return vol
+        # 3) Random flips
+        if random.random() > 0.5:
+            x = torch.flip(x, dims=[-1])
+        if random.random() > 0.5:
+            x = torch.flip(x, dims=[-2])
 
-    def _robust_norm_qmag_global(self, vol: torch.Tensor) -> torch.Tensor:
-        vr, vi = vol[0], vol[1]
-        mag = torch.sqrt(vr * vr + vi * vi)
-        q = torch.quantile(mag.reshape(-1), self.norm_q)
-        if not torch.isfinite(q) or q <= 1e-6:
-            return vol
-        gain_q = self.norm_target / max(q, 1e-6)
-        gain_q = min(gain_q, self.norm_max_gain)
-        # prevent clipping: ensure max(|vol|)*gain <= 1.0
-        max_abs = vol.abs().amax()
-        gain_clip = (1.0 / max_abs).item() if max_abs > 0 else gain_q
-        gain = min(gain_q, gain_clip)
-        return vol * gain
+        # 4) Colleague-matched preprocessing (scale→gamma→fixed max)
+        if self.apply_preproc:
+            x = preprocess_complex_2thw(x, gamma=0.1, scale=0.2, final_div=1.15)
 
-    # ---------- spatial crop helpers (64×64) ----------
-    def _ensure_min_spatial(self, vol: torch.Tensor, min_h: int, min_w: int) -> torch.Tensor:
-        C, T, H, W = vol.shape
-        pad_h = max(0, min_h - H)
-        pad_w = max(0, min_w - W)
-        if pad_h == 0 and pad_w == 0:
-            return vol
-        x = vol.permute(1, 0, 2, 3).contiguous().view(1, T * C, H, W)
-        ph_top = pad_h // 2
-        ph_bot = pad_h - ph_top
-        pw_left = pad_w // 2
-        pw_right = pad_w - pw_left
-        x = F.pad(x, (pw_left, pw_right, ph_top, ph_bot), mode="reflect")
-        Hp, Wp = x.shape[-2], x.shape[-1]
-        x = x.view(T, C, Hp, Wp).permute(1, 0, 2, 3).contiguous()
+        # Final guard
+        assert x.shape == (2, self.t_frames, self.t_H, self.t_W), f"Got {tuple(x.shape)}"
         return x
 
-    def _random_crop_hw(self, vol: torch.Tensor, ch: int, cw: int) -> torch.Tensor:
-        vol = self._ensure_min_spatial(vol, ch, cw)
-        _, _, H, W = vol.shape
-        y0 = 0 if H == ch else self.rng.randint(0, H - ch)
-        x0 = 0 if W == cw else self.rng.randint(0, W - cw)
-        return vol[:, :, y0:y0 + ch, x0:x0 + cw].contiguous()
-
-    # ---------- temporal helpers ----------
-    @staticmethod
-    def _oddify(vol: torch.Tensor) -> torch.Tensor:
-        T = vol.shape[1]
-        return vol if (T % 2 == 1) else vol[:, :T - 1]
-
-    def _pick_train_clip_indices(self, T: int, L: int) -> List[int]:
-        """Random contiguous window of length L; circular wrap if needed."""
-        if T >= L:
-            start = self.rng.randint(0, T - L)
-            return list(range(start, start + L))
-        start = self.rng.randint(0, T - 1)
-        return [(start + i) % T for i in range(L)]
-
-    # ---------- dataset API ----------
-    def __getitem__(self, idx: int):
-        shard_path, key = self._samples[idx]
-        vol = self._load_volume(shard_path, key)  # [2, T, H, W]
-
-        if self.split == "train":
-            # choose L then take contiguous clip
-            L = self.fixed_train_L if self.fixed_train_L is not None else self.rng.choice(self.t_choices)
-            idxs = self._pick_train_clip_indices(vol.shape[1], L)
-            clip = vol[:, idxs]  # [2, L, H, W]
-            # spatial crop to 64×64
-            clip = self._random_crop_hw(clip, self.crop_h, self.crop_w)
-            return clip  # [2, L, 64, 64]
-        else:
-            # full video, oddified (no crop)
-            return self._oddify(vol).contiguous()
-
-    # ---------- cleanup ----------
-    def close(self):
-        for p, f in list(self._h5_cache.items()):
-            try: f.close()
-            except: pass
-        self._h5_cache.clear()
-
-    def __del__(self):
-        try: self.close()
-        except: pass
+    def getshapes(self):
+        return (len(self.data_list), 2, self.t_frames, self.t_H, self.t_W)

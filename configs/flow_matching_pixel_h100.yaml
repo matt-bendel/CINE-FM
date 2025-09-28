@@ -1,44 +1,42 @@
 train_dataset:
   name: CINEPixelDataset
   args:
-    root: /users/PAS2812/mattbendel/CINE_data
-    split: train
-    fixed_train_L: 8          # 8 frames for training (even OK)
-    crop_h: 64
-    crop_w: 64
-    normalize: percentile
-    seed: 123
-    t_choices: [8]
+    data_path: /users/PAS2812/mattbendel/CINE_data/train.pkl  # <- memory-mapped pickle
+    t_frames: 8
+    crop_hw: [64, 64]
+    std_scale: 1.5
+    apply_preproc: true
+    log_stats: true
 
 val_dataset:
   name: CINEPixelDataset
   args:
-    root: /users/PAS2812/mattbendel/CINE_data
-    split: val
-    normalize: percentile
-    seed: 123
+    data_path: /users/PAS2812/mattbendel/CINE_data/val.pkl
+    t_frames: 8
+    crop_hw: [64, 64]
+    std_scale: 1.5
+    apply_preproc: true
+    log_stats: false
 
 dataloader:
-  train_batch_size: 4         # pixel batches (you can tune)
+  train_batch_size: 4
   val_batch_size: 1
   num_workers: 8
   pin_memory: false
   shuffle: true
 
-# No VAE block anymore (fully pixel-space)
-
+# Model is your pixel-space FM network
 model:
-  import_path: CardiacFM.model.transformer_pixel    # <-- your pixel-space FM model module
-  class_name: FlowMatchTransformer              # <-- pixel model class
+  import_path: CardiacFM.model.transformer_pixel
+  class_name: FlowMatchTransformer
   args:
     latent_channels: 2
     hidden_size: 864
     depth: 40
     heads: 12
     mlp_ratio: 4.0
-    patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
-    rope_axes_dim: [8, 32, 32]
-  # load_state_dict_from: /storage/matt_models/latent_fm/flowmatch_pixels/step_0020000/state.pt
+    patch_size: [1, 2, 2]
+    rope_axes_dim: [16, 28, 28]
   load_state_dict_from: none
   strict_load: false
   resume: false
@@ -56,16 +54,22 @@ optim:
     eta_min_ratio: 0.1
 
 validation:
-  # pixel-space patchify parameters for reconstruction (and inverse sampling)
   patch_h: 64
   patch_w: 64
   patch_t: 8
-  overlap_spatial_pct: 1.0     # NEW: tunable overlap in %
+  overlap_spatial_pct: 1.0
+  num_uncond_videos: 8
+  latent_grid_fps: 7
+  # For inverse/DC path (kept here for later use)
+  dc_lambda: 0.3
+  dc_every: 4
+  dc_step_size: 5.0
 
 sampler:
   num_steps: 50
-  variant: bh1
-  shift: 3.0                   # or use your flux mapping; this is fine
+  t_scale: 1000        # <-- kept at 1000 as requested
+  # optional extras if you later add reparam variants
+  sigma_exponent: 1.0
 
 logging:
   project: cardiac-lfm
@@ -77,10 +81,5 @@ logging:
   wandb_dir: /users/PAS2812/mattbendel/wandb
   wandb_cache_dir: /users/PAS2812/mattbendel/wandbcache
 
-teacache:
-  enable: false
-  rel_l1_thresh: 0.14
-  poly_file: teacache_poly.json
-
 deg:
-  R: 8   # GRO R used for ZF target
+  R: 8

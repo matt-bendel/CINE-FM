@@ -1,7 +1,7 @@
 train_dataset:
   name: CINEFlowMatchLatentDataset
   args:
-    root: /storage/CINE_data/latents_like_cine   # where the new precompute wrote latents
+    root: /storage/CINE_data/latents_like_cine_no_empty_4   # where the new precompute wrote latents
     split: train      
 
 val_dataset:
@@ -12,7 +12,7 @@ val_dataset:
     normalize: qmag
 
 dataloader:
-  train_batch_size: 8     # each item yields a list of clips; we flatten across the batch
+  train_batch_size: 12     # each item yields a list of clips; we flatten across the batch
   val_batch_size: 1
   num_workers: 8
   pin_memory: false
@@ -31,7 +31,7 @@ vae:
     attn_scales: []
   load_state_dict_from: '/storage/matt_models/cardiac_vae/videos/step_0195000/state.pt'
   strict_load: false
-  resume: false
+  resume: true
 
 # FM transformer
 model:
@@ -39,12 +39,12 @@ model:
   class_name: LatentFlowMatchTransformer
   args:
     latent_channels: 16
-    hidden_size: 1056
+    hidden_size: 1280
     depth: 40
-    heads: 24
+    heads: 16
     mlp_ratio: 4.0
     patch_size: [1, 2, 2]   # latent tokens = n'*H'*W'
-    rope_axes_dim: [4, 20, 20]
+    rope_axes_dim: [12,34,34]
   load_state_dict_from: none
   strict_load: false
   resume: false
@@ -64,9 +64,22 @@ validation:
   patch_h: 80
   patch_w: 80
   patch_t: 7
-  overlap_spatial_pct: 1.0
+  # spatial overlap between patches
+  overlap_spatial_pct: 1.0   # e.g., 5.0 means 5% overlap
+
+  # ---- DC guidance knobs ----
+  dc_iters: 2                # K inner DC steps per sampler step
   dc_lambda: 0.3
-  dc_every: 4
+  dc_step_scale: 15.0
+
+  # microbatching controls
+  dc_group_size: 0           # 0 or null => use ALL patches together (fastest, higher mem)
+  # dc_group_size: 32        # example: process 32 patches at a time if memory is tight
+  dc_decode_mb: 64           # VAE decode batch *inside DC* (independent of patch_batch)
+  dc_decode_bs: 8
+
+  # diagnostics
+  debug_patch_placement: true
 
 sampler:
   num_steps: 50
@@ -87,3 +100,6 @@ teacache:
   enable: false         # or false
   rel_l1_thresh: 0.14  # start around [0.10, 0.15], per your fit script’s printout
   poly_file: teacache_poly.json
+
+deg:
+  R: 2

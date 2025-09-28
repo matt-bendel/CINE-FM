@@ -77,6 +77,49 @@ def write_latent_item(hf: h5py.File, name: str, z: np.ndarray, attrs: Dict[str, 
     g.create_dataset("z", data=z, dtype="float32", compression="lzf", chunks=True)
     for k, v in attrs.items(): g.attrs[k] = v
 
+# ---------------- emptiness logic ----------------
+
+@torch.no_grad()
+def _frames_nonempty_mask(
+    clip_2thw: torch.Tensor,
+    q: float,
+    q_thr: float,
+    px_thr: float,
+    frac_thr: float,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    clip_2thw: [2, T(=7), H, W], on device
+    A frame is 'non-empty' if (quantile >= q_thr) OR (frac_above_px_thr >= frac_thr).
+    Returns:
+      mask: [T] boolean
+      stats: {'qvals': [T], 'frac': [T]}
+    """
+    mag = torch.sqrt(clip_2thw[0]**2 + clip_2thw[1]**2)        # [T,H,W]
+    T = mag.shape[0]
+    flat = mag.view(T, -1)
+
+    qvals = torch.quantile(flat, float(q), dim=1)              # [T]
+    frac  = (flat > float(px_thr)).float().mean(dim=1)         # [T]
+    mask  = (qvals >= float(q_thr)) & (frac >= float(frac_thr))
+    return mask, {"qvals": qvals, "frac": frac}
+
+def _clip_is_acceptable(
+    clip_2thw: torch.Tensor,
+    empty_q: float,
+    empty_q_thr: float,
+    empty_px_thr: float,
+    empty_frac_thr: float,
+    min_nonempty: int,
+    require_center_nonempty: bool,
+) -> Tuple[bool, Dict[str, Any]]:
+    mask, stats = _frames_nonempty_mask(clip_2thw, empty_q, empty_q_thr, empty_px_thr, empty_frac_thr)
+    n_good = int(mask.sum().item())
+    ok = (n_good >= int(min_nonempty))
+    if require_center_nonempty:
+        center_ok = bool(mask[int(clip_2thw.shape[1] // 2)].item())
+        ok = ok and center_ok
+    return ok, {"mask": mask, "n_good": n_good, **stats}
+
 # ---------------- core ----------------
 
 @torch.no_grad()
@@ -96,6 +139,14 @@ def precompute_train_latents_like_cine(
     vae_batch: int,
     rng_seed: int,
     cfg: Dict[str, Any],
+    # ---- new emptiness controls ----
+    skip_empty: bool,
+    empty_q: float,
+    empty_q_thr: float,
+    empty_px_thr: float,
+    empty_frac_thr: float,
+    min_nonempty: int,
+    require_center_nonempty: bool,
 ):
     assert fixed_L == 7, "L must be 7 (fixed)."
     assert fixed_L % 2 == 1, "L must be odd."
@@ -133,6 +184,15 @@ def precompute_train_latents_like_cine(
         "latent_shape": {"Cz": Cz, "T_lat": nt, "H": H_lat, "W": W_lat},
         "pixel_clip": {"L": fixed_L, "crop_h": crop_h, "crop_w": crop_w},
         "include_flip": bool(include_flip),
+        "emptiness": {
+            "enabled": bool(skip_empty),
+            "q": float(empty_q),
+            "q_thr": float(empty_q_thr),
+            "px_thr": float(empty_px_thr),
+            "frac_thr": float(empty_frac_thr),
+            "min_nonempty": int(min_nonempty),
+            "require_center": bool(require_center_nonempty),
+        },
         "items": []
     }
 
@@ -151,6 +211,12 @@ def precompute_train_latents_like_cine(
 
     buf_x: List[torch.Tensor] = []
     buf_meta: List[Dict[str, Any]] = []
+
+    stats = {
+        "attempted_clips": 0,
+        "kept_clips": 0,
+        "skipped_empty": 0,
+    }
 
     def flush():
         nonlocal item_counter
@@ -178,6 +244,9 @@ def precompute_train_latents_like_cine(
         buf_x.clear(); buf_meta.clear()
 
     print(f"[info] vae_batch={vae_batch}, shard_size={SHARD_SIZE}, samples_per_video={samples_per_video}, include_flip={include_flip}")
+    if skip_empty:
+        print(f"[info] skip_empty=True  q={empty_q}  q_thr={empty_q_thr}  px_thr={empty_px_thr}  "
+              f"frac_thr={empty_frac_thr}  min_nonempty={min_nonempty}  require_center={require_center_nonempty}")
 
     for sp in in_shards:
         with h5py.File(sp, "r", libver="latest") as fr:
@@ -190,8 +259,19 @@ def precompute_train_latents_like_cine(
                 T = int(vol.shape[1])
                 for si in range(int(samples_per_video)):
                     idxs = _pick_train_clip_indices(T, fixed_L, rng)
-                    clip = vol[:, idxs]                              # [2,7,H,W]
-                    clip = _random_crop_hw(clip, crop_h, crop_w, rng)# [2,7,80,80]
+                    clip = vol[:, idxs]                               # [2,7,H,W]
+                    clip = _random_crop_hw(clip, crop_h, crop_w, rng) # [2,7,80,80]
+
+                    stats["attempted_clips"] += 1
+
+                    if skip_empty:
+                        ok, _dbg = _clip_is_acceptable(
+                            clip, empty_q, empty_q_thr, empty_px_thr, empty_frac_thr,
+                            min_nonempty=min_nonempty, require_center_nonempty=require_center_nonempty
+                        )
+                        if not ok:
+                            stats["skipped_empty"] += 1
+                            continue
 
                     # original
                     buf_x.append(clip)
@@ -204,12 +284,14 @@ def precompute_train_latents_like_cine(
                         "crop_h": int(crop_h),
                         "crop_w": int(crop_w),
                     })
+                    stats["kept_clips"] += 1
                     if len(buf_x) >= vae_batch:
                         flush()
 
                     # optional horizontal flip (mirror W)
                     if include_flip:
                         clip_flip = clip.flip(-1)
+                        # No need to re-check emptiness; flip preserves energy stats.
                         buf_x.append(clip_flip)
                         buf_meta.append({
                             "source_shard": os.path.basename(sp),
@@ -220,19 +302,25 @@ def precompute_train_latents_like_cine(
                             "crop_h": int(crop_h),
                             "crop_w": int(crop_w),
                         })
+                        stats["kept_clips"] += 1
                         if len(buf_x) >= vae_batch:
                             flush()
 
     flush()
     if hf is not None: hf.close()
     with open(meta_path, "w") as f: json.dump(meta, f, indent=2)
-    print(f"[done] wrote {item_counter} latent clips  →  {meta_path}")
+    kept = stats["kept_clips"]
+    skipped = stats["skipped_empty"]
+    attempted = stats["attempted_clips"]
+    print(f"[done] wrote {kept} latent clips  →  {meta_path}")
+    print(f"[stats] attempted={attempted}  kept={kept}  skipped_empty={skipped}  "
+          f"keep_rate={(kept/max(1,attempted)):.3f}")
 
 def main():
     ap = argparse.ArgumentParser("Precompute training latents like CINEDataset(train), with optional horizontal flips.")
     ap.add_argument("--config", default="configs/vae.yaml")
     ap.add_argument("--in_root",  default="/storage/CINE_data")
-    ap.add_argument("--out_root", default="/storage/CINE_data/latents_like_cine")
+    ap.add_argument("--out_root", default="/storage/CINE_data/latents_like_cine_no_empty_4")
     ap.add_argument("--vae_import", default="CardiacVAE.model.vae")
     ap.add_argument("--vae_class",  default="CardiacVAE")
     ap.add_argument("--vae_ckpt",   default="/storage/matt_models/cardiac_vae/videos/step_0195000/state.pt")
@@ -248,21 +336,21 @@ def main():
     ap.add_argument("--vae_batch", type=int, default=64)  # big is fine (no grads)
     ap.add_argument("--seed",      type=int, default=123)
 
+    # ---- emptiness controls (match CINEDataset spirit) ----
     ap.add_argument("--skip_empty", action="store_true",
                     help="Drop clips where too many frames are near-empty.")
     ap.add_argument("--empty_q", type=float, default=0.99,
                     help="Quantile for per-frame energy scoring.")
-    ap.add_argument("--empty_q_thr", type=float, default=0.015,
+    ap.add_argument("--empty_q_thr", type=float, default=0.3,
                     help="Threshold on that quantile to count a frame as non-empty.")
-    ap.add_argument("--empty_px_thr", type=float, default=0.02,
+    ap.add_argument("--empty_px_thr", type=float, default=0.05,
                     help="Pixel floor used in the fraction-of-pixels test.")
-    ap.add_argument("--empty_frac_thr", type=float, default=0.002,
+    ap.add_argument("--empty_frac_thr", type=float, default=0.3,
                     help="Min fraction of pixels above empty_px_thr for a frame to be non-empty.")
     ap.add_argument("--min_nonempty", type=int, default=5,
                     help="Require at least this many non-empty frames in a 7-frame clip.")
     ap.add_argument("--require_center_nonempty", action="store_true",
                     help="If set, the center frame (t=3) must be non-empty.")
-
 
     args = ap.parse_args()
     with open(args.config, "r") as f:
@@ -283,7 +371,15 @@ def main():
         device=args.device,
         vae_batch=int(args.vae_batch),
         rng_seed=int(args.seed),
-        cfg=cfg
+        cfg=cfg,
+        # pass emptiness args through
+        skip_empty=bool(args.skip_empty),
+        empty_q=float(args.empty_q),
+        empty_q_thr=float(args.empty_q_thr),
+        empty_px_thr=float(args.empty_px_thr),
+        empty_frac_thr=float(args.empty_frac_thr),
+        min_nonempty=int(args.min_nonempty),
+        require_center_nonempty=bool(args.require_center_nonempty),
     )
 
 if __name__ == "__main__":

@@ -260,6 +260,19 @@ class AdaLayerNormZeroSingle(nn.Module):
         x_mod = xn * (1 + scale) + shift               # [B,L,D]
         return x_mod, gate                              # gate will be broadcast later
 
+class AdaLayerNormContinuous(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.fc = nn.Linear(dim, 2 * dim)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, D], emb: [B, D]
+        scale, shift = self.fc(self.act(emb)).chunk(2, dim=-1)  # [B, D] each
+        x = self.norm(x)
+        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return x
 
 class SingleStreamBlock(nn.Module):
     """
@@ -311,6 +324,15 @@ class SingleStreamBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.mlp = MLP(dim, mlp_ratio=mlp_ratio)
 
+        # --- AdaLN-Zero style init (stabilizes high-noise timesteps) ---
+        nn.init.zeros_(self.proj_attn.weight)
+        nn.init.zeros_(self.proj_attn.bias)
+        nn.init.zeros_(self.mlp.fc2.weight)
+        nn.init.zeros_(self.mlp.fc2.bias)
+        nn.init.zeros_(self.adaln.linear.weight)
+        nn.init.zeros_(self.adaln.linear.bias)
+
+
     def forward(self, x, tvec, rope_freqs=None):
         B, L, D = x.shape
 
@@ -328,6 +350,7 @@ class SingleStreamBlock(nn.Module):
         if rope_freqs is not None:
             q_bhl, k_bhl = _apply_rope_qk(q_bhl, k_bhl, rope_freqs)
         # backend expects BLH
+        dtype = x.dtype
         q_blh = q_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
         k_blh = k_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
         v_blh = v_bhl.transpose(1, 2).contiguous().to(torch.bfloat16)
@@ -432,6 +455,7 @@ class LatentFlowMatchTransformer(nn.Module):
             for _ in range(depth)
         ])
         # Final projection (velocity)
+        self.norm_out = AdaLayerNormContinuous(self.hidden)
         self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(4, 20, 20))  # created at runtime after we know token grid
 
         # ---------------- TeaCache state ----------------
@@ -541,6 +565,7 @@ class LatentFlowMatchTransformer(nn.Module):
             for blk in self.blocks:
                 x = blk(x, tvec, rope_freqs=rope_freqs)
 
+        x = self.norm_out(x, tvec)
         vel = self.final(x)  # [B,Cz,n,H,W]
         return vel
         

@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import numpy as np
 import wandb
+import gc
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
@@ -285,13 +286,13 @@ class LatentFMTrainer:
 
         unwrapped = self.accelerator.unwrap_model(self.model)
         self.ema = Ema(unwrapped, decay=float(self.cfg["optim"].get("ema_decay", 0.999)))
-        # if resume_state is not None and "ema" in resume_state:
-            # ema_state = {k: v.to(self.accelerator.device) for k, v in resume_state["ema"].items()}
-            # try:
-                # self.ema.load_shadow(ema_state)
-                # print("[resume] restored EMA shadow")
-            # except Exception as e:
-                # print(f"[resume] failed to restore EMA: {e}")
+        if resume_state is not None and "ema" in resume_state:
+            ema_state = {k: v.to(self.accelerator.device) for k, v in resume_state["ema"].items()}
+            try:
+                self.ema.load_shadow(ema_state)
+                print("[resume] restored EMA shadow")
+            except Exception as e:
+                print(f"[resume] failed to restore EMA: {e}")
                 
         self.grad_clip = float(opt_cfg.get("grad_clip", 0.0))
 
@@ -378,7 +379,10 @@ class LatentFMTrainer:
         # Rectified flow loss (same math as before, just no permutation/flattening)
         N = Z.shape[0]
         noise  = torch.randn_like(Z)                        # bf16
-        t_vec  = torch.rand((N,), device=device, dtype=torch.bfloat16)   # U(0,1)
+        if self.global_step < 100000:
+            t_vec  = torch.rand((N,), device=device, dtype=torch.bfloat16).sqrt()   # U(0,1)
+        else:
+            t_vec  = torch.rand((N,), device=device, dtype=torch.bfloat16)   # U(0,1)
 
         t_b = t_vec.view(N, *([1] * (Z.dim() - 1)))        # [B,1,1,1,1]
         x_t = (1.0 - t_b) * Z + t_b * noise                # bf16
@@ -449,14 +453,25 @@ class LatentFMTrainer:
                         scalars["lr"] = self.optimizer.param_groups[0]["lr"]
                         wandb.log(scalars, step=self.global_step)
 
-                    if (self.global_step % log_cfg["val_every_steps"] == 0) and self.global_step > 0:
+                    if (self.global_step % log_cfg["val_every_steps"] == 0):# and self.global_step > 0:
                         if self.accelerator.is_main_process:
                             pbar.write(f"[val] step {self.global_step}")
                         # self.validate()
+                        torch.cuda.empty_cache()
                         self.validate_fixed_t_x0_from_data()
+                        self.validate_fixed_t_x0_from_data(use_ema=True)
                         self.validation_simple()
                         self.validation_simple(use_ema=True)
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        self.accelerator.wait_for_everyone()
                         self.validation_simple_inv()
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        self.accelerator.wait_for_everyone()
+                        self.validation_simple_inv(use_ema=True)
+                        torch.cuda.empty_cache()
+                        gc.collect()
                         self.accelerator.wait_for_everyone()
 
                     if (self.global_step % log_cfg["save_every_steps"] == 0) and self.global_step > 0:
@@ -622,7 +637,7 @@ class LatentFMTrainer:
         self.model.train()
 
     @torch.no_grad()
-    def validate_fixed_t_x0_from_data(self, t_values=(0.01, 0.10, 0.25, 0.50, 0.75, 1.00)):
+    def validate_fixed_t_x0_from_data(self, use_ema: bool = False, t_values=(0.01, 0.10, 0.25, 0.50, 0.75, 1.00)):
         """
         Latent-space version of 'predict x0 from data':
         • take one val video [2,T,H,W]
@@ -632,6 +647,8 @@ class LatentFMTrainer:
         • decode x0 -> pixel patches; log a grid video of magnitudes per t
         """
         self.model.eval()
+        if use_ema:
+            self.ema.apply_to(self.model)
         device = self.accelerator.device
         vcfg   = self.cfg.get("validation", {})
         pt     = int(vcfg.get("patch_t", 7))
@@ -780,6 +797,9 @@ class LatentFMTrainer:
                 tag = f"val_latent/x0_pred_from_data_t_{t_scalar:.2f}".replace(".", "p")
                 wandb.log({tag: vid}, step=self.global_step)
 
+        if use_ema:
+            self.ema.restore(self.model)
+
         self.model.train()
 
     @torch.no_grad()
@@ -908,51 +928,38 @@ class LatentFMTrainer:
 
     def validation_simple_inv(self, use_ema: bool = False):
         """
-        Euler(x0) + pixel-space DC (L2 vs zero-filled) with **grads only inside DC**.
+        Euler(x0) + pixel-space DC (against *downsampled* recon) with grads only inside DC.
 
-        • Pick one validation video [2,T,H,W]
-        • Spatially tile (default 5% overlap) → P latent patches
-        • Process temporal chunks of length pt with 1-frame overlap
-        • Each Euler step:
-            - net forward (no grad)
-            - build x0_pred (latent)
-            - DC: micro-batched decode-with-grad → assemble → loss vs x_zf → grad step in latent space
-            - Euler update using x0 after DC
-        • Logs per-chunk recon and a final full-video recon to W&B
+        DC loss is computed **patch-wise** after applying A (FFT->mask->IFFT) to the
+        full-frame reconstruction, so each loss term compares:
+            patchify(  A( full_decode(z) )  )  vs  patchify( x_zf )
+
+        Sanity checks:
+        • Constant-tiles placement image (patch borders visible, correct placement)
+        • Global ramp (patchify→blend) + error map (should be seam-free)
+
+        Logs per-chunk triptychs: GT | ZFR | DC.
         """
-        import time
+        import time, math
         import numpy as _np
         import torch
+        import torch.nn.functional as F
         from tqdm.auto import tqdm
-        from data.deg import MRIDeg  # mask provider
+        from data.deg import MRIDeg
 
-        device = self.accelerator.device
-        self.model.eval()
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        if use_ema:
-            self.ema.apply_to(unwrapped)
+        # ----------------- small helpers -----------------
+        def _to_mag(fr_2hw: torch.Tensor) -> torch.Tensor:
+            return torch.sqrt(torch.clamp(fr_2hw[0]**2 + fr_2hw[1]**2, min=0.0))
 
-        # -------------- config --------------
-        vcfg   = self.cfg.get("validation", {})
-        ph     = int(vcfg.get("patch_h", 80))
-        pw     = int(vcfg.get("patch_w", 80))
-        pt     = int(vcfg.get("patch_t", 7))            # temporal chunk in *pixel* space
-        bs_vae = int(vcfg.get("patch_batch", 64))       # VAE streaming batch
-        dc_patch_mb = int(vcfg.get("dc_patch_mb", 8))   # micro-batch over patches for DC
-        overlap_spatial_pct = float(vcfg.get("overlap_spatial_pct", 5.0))
-        R_default = int(self.cfg.get("deg", {}).get("R", 8))
-        dc_lambda = float(vcfg.get("dc_lambda", 0.3))
-
-        # cap any large VAE decode batch to 8 during sampling for memory safety
-        bs_vae = min(bs_vae, 8)
-
-        # -------------- small helpers --------------
-        def _pct_to_stride_len(P, pct):
-            ov = max(0.0, min(99.0, float(pct))) / 100.0
-            return max(1, int(torch.ceil(torch.tensor(P * (1.0 - ov))).item()))
+        def _to_mag_from_complex(x_cmplx_thw: torch.Tensor) -> torch.Tensor:
+            return x_cmplx_thw.abs()
 
         def _append_dims(v: torch.Tensor, target_ndim: int) -> torch.Tensor:
             return v[(...,) + (None,) * (target_ndim - v.ndim)]
+
+        def _pct_to_stride_len(P, pct):
+            ov = max(0.0, min(99.0, float(pct))) / 100.0
+            return max(1, int(round(P * (1.0 - ov))))
 
         def _temporal_chunk_starts(T: int, win: int):
             if win >= T: return [0]
@@ -974,130 +981,143 @@ class LatentFMTrainer:
             x  = torch.fft.ifft2(k, norm="ortho")
             return x  # complex [T,H,W]
 
-        def _axis_weights(L_eff: int, idx: int, n: int, O: int, device):
-            has_prev = (idx > 0); has_next = (idx < n - 1)
-            L_left  = min(O if has_prev else 0, L_eff)
-            L_right = min(O if has_next else 0, L_eff)
-            if L_left + L_right > L_eff:
-                if L_left > 0 and L_right > 0:
-                    tot = L_left + L_right
-                    L_left_new  = max(1, int(round(L_eff * (L_left / tot))))
-                    L_right_new = L_eff - L_left_new
-                    L_left, L_right = L_left_new, L_right_new
-                else:
-                    L_left  = min(L_left,  L_eff)
-                    L_right = L_eff - L_left
-            w = torch.ones(L_eff, dtype=torch.float32, device=device)
-            if L_left > 0:
-                w[:L_left] = 0.5 if L_left == 1 else torch.linspace(0.0, 1.0, steps=L_left, device=device)
-            if L_right > 0:
-                w[-L_right:] = 0.5 if L_right == 1 else torch.linspace(1.0, 0.0, steps=L_right, device=device)
-            return w
+        # ----- unified, seam-free spatial tiling (row-major, edges anchored) -----
+        def _grid_coords_anchored(L: int, p: int, s: int):
+            if L <= p:
+                return [0]
+            n = 1 + math.ceil((L - p) / s)
+            starts = []
+            for j in range(n):
+                y = j * s
+                if y + p > L:
+                    y = L - p
+                if not starts or y != starts[-1]:
+                    starts.append(y)
+            return starts
 
-        def _spatial_coords(H: int, W: int, ph: int, pw: int, sh: int, sw: int):
-            n1 = max(1, (H - ph + sh - 1) // sh + 1)
-            n2 = max(1, (W - pw + sw - 1) // sw + 1)
+        def _make_coords(H: int, W: int, ph: int, pw: int, sh: int, sw: int):
+            ys = _grid_coords_anchored(H, ph, sh)
+            xs = _grid_coords_anchored(W, pw, sw)
             coords = []
-            for j in range(n1):
-                y0 = j * sh; y1 = min(y0 + ph, H); s1 = y1 - y0
-                for k in range(n2):
-                    x0 = k * sw; x1 = min(x0 + pw, W); s2 = x1 - x0
-                    coords.append((y0, y1, s1, x0, x1, s2, j, k, n1, n2))
-            return coords, n1, n2
-
-        def _spatial_patchify_video(x_2thw: torch.Tensor, ph: int, pw: int, sh: int, sw: int, coords):
-            _, Tt, Hh, Ww = x_2thw.shape
-            out = torch.zeros((len(coords), 2, Tt, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
-            for idx, (y0,y1,s1,x0,x1,s2, *_rest) in enumerate(coords):
-                patch = torch.zeros((2, Tt, ph, pw), dtype=x_2thw.dtype, device=x_2thw.device)
-                patch[:, :, :s1, :s2] = x_2thw[:, :, y0:y1, x0:x1]
-                out[idx] = patch
-            return out  # [P,2,T,ph,pw]
-
-        def _depatchify2d_over_time(patches_P2Thw: torch.Tensor,
-                                    H: int, W: int, ph: int, pw: int, sh: int, sw: int,
-                                    coords) -> torch.Tensor:
-            device = patches_P2Thw.device
-            dtype  = patches_P2Thw.dtype
-            P, _, T, _, _ = patches_P2Thw.shape
-            out_num = torch.zeros((2, T, H, W), dtype=dtype, device=device)
-            out_den = torch.zeros((1, T, H, W), dtype=torch.float32, device=device)
-
-            O1 = max(0, ph - sh); O2 = max(0, pw - sw)
-            n1 = coords[0][8]; n2 = coords[0][9]
-
-            for idx, (y0,y1,s1,x0,x1,s2,j,k, *_rest) in enumerate(coords):
-                w1 = _axis_weights(s1, j, n1, O1, device)
-                w2 = _axis_weights(s2, k, n2, O2, device)
-                w = (w1[None, None, :, None] * w2[None, None, None, :])  # [1,1,s1,s2]
-                p = patches_P2Thw[idx][:, :, :s1, :s2]                   # [2,T,s1,s2]
-                out_num[:, :, y0:y1, x0:x1] += (p * w).to(out_num.dtype)
-                out_den[:, :, y0:y1, x0:x1] += w
-            out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
-            return out_num / out_den.to(out_num.dtype)
-
-        def _decode_latent_patches(z_Pcnhw: torch.Tensor, max_bs: int) -> torch.Tensor:
-            outs = []
-            for i in range(0, z_Pcnhw.shape[0], max_bs):
-                chunk = z_Pcnhw[i:i+max_bs]
-                z_list = [z.unsqueeze(0) for z in chunk]  # list [1,Cz,nt,H',W']
-                dec = self.vae(z_list, op="decode")       # list [1,2,pt,ph,pw]
-                for o in dec:
-                    if isinstance(o, (list, tuple)): o = o[0]
-                    outs.append(o.squeeze(0))            # [2,pt,ph,pw]
-            return torch.stack(outs, dim=0)              # [P,2,pt,ph,pw]
-
-        def _assemble_subset_to_full(patches_subset: torch.Tensor, idxs, H, W, ph, pw, sh, sw, coords):
-            device = patches_subset.device
-            dtype  = patches_subset.dtype
-            Q, _, pt_eff, _, _ = patches_subset.shape
-            out_num = torch.zeros((2, pt_eff, H, W), dtype=torch.float32, device=device)
-            out_den = torch.zeros((1, pt_eff, H, W), dtype=torch.float32, device=device)
-            O1 = max(0, ph - sh); O2 = max(0, pw - sw)
-            n1 = coords[0][8]; n2 = coords[0][9]
-            for local_i, gidx in enumerate(idxs):
-                y0,y1,s1,x0,x1,s2,j,k, *_ = coords[gidx]
-                w1 = _axis_weights(s1, j, n1, O1, device)
-                w2 = _axis_weights(s2, k, n2, O2, device)
-                w  = (w1[None, None, :, None] * w2[None, None, None, :])  # [1,1,s1,s2]
-                p  = patches_subset[local_i][:, :, :s1, :s2].to(torch.float32)  # [2,pt,s1,s2]
-                out_num[:, :, y0:y1, x0:x1] += (p * w)
-                out_den[:, :, y0:y1, x0:x1] += w
-            out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
-            return out_num / out_den
+            for y0 in ys:
+                y1 = min(y0 + ph, H); s1 = y1 - y0
+                for x0 in xs:
+                    x1 = min(x0 + pw, W); s2 = x1 - x0
+                    coords.append((y0, y1, s1, x0, x1, s2))
+            return coords, len(ys), len(xs)
 
         @torch.no_grad()
-        def _assemble_full_from_latents_nograd(vae, z_Pcnhw, H, W, ph, pw, sh, sw, coords, max_bs):
-            out_num = None
-            out_den = None
-            O1 = max(0, ph - sh); O2 = max(0, pw - sw)
-            n1 = coords[0][8]; n2 = coords[0][9]
-            idx = 0
-            for i in range(0, z_Pcnhw.shape[0], max_bs):
+        def _spatial_patchify_video(x_2Thw: torch.Tensor, ph: int, pw: int, coords):
+            _, T, H, W = x_2Thw.shape
+            P = len(coords)
+            out = torch.zeros((P, 2, T, ph, pw), dtype=x_2Thw.dtype, device=x_2Thw.device)
+            for idx, (y0,y1,s1,x0,x1,s2) in enumerate(coords):
+                out[idx, :, :, :s1, :s2] = x_2Thw[:, :, y0:y1, x0:x1]
+            return out
+
+        def _patchify_image_differentiable(x_2Thw: torch.Tensor, coords, ph: int, pw: int) -> torch.Tensor:
+            """
+            Differentiable extractor: [2,T,H,W] -> [P,2,T,ph,pw]
+            """
+            patches = []
+            for (y0,y1,s1,x0,x1,s2) in coords:
+                sl = x_2Thw[:, :, y0:y1, x0:x1]          # [2,T,s1,s2] (view)
+                pad = (0, pw - s2, 0, ph - s1)           # (W_left=0, W_right, H_top=0, H_bottom)
+                p = F.pad(sl, pad)                        # [2,T,ph,pw], differentiable
+                patches.append(p)
+            return torch.stack(patches, dim=0)            # [P,2,T,ph,pw]
+
+        def _build_wmaps(coords, device, dtype, mode: str = "box"):
+            """
+            Per-patch weights [s1,s2]; 'box' (ones) => partition-of-unity after normalization.
+            """
+            wmaps = []
+            for (y0,y1,s1,x0,x1,s2) in coords:
+                if mode == "hann" and s1 > 1 and s2 > 1:
+                    wy = torch.hann_window(s1, periodic=False, dtype=torch.float32, device=device)
+                    wx = torch.hann_window(s2, periodic=False, dtype=torch.float32, device=device)
+                    w  = (wy[:, None] * wx[None, :]).to(dtype)
+                else:
+                    w  = torch.ones((s1, s2), dtype=dtype, device=device)
+                wmaps.append(w)
+            return wmaps
+
+        def _blend_full(patches_P2Tphw: torch.Tensor, H: int, W: int, coords, wmaps):
+            """
+            Seamless overlap-add: numerator = Σ w·p, denom = Σ w, then divide.
+            Differentiable w.r.t. patches.
+            """
+            device = patches_P2Tphw.device
+            P, C, T, ph, pw = patches_P2Tphw.shape
+            assert C == 2
+            num = torch.zeros((2, T, H, W), dtype=torch.float32, device=device)
+            den = torch.zeros((1, T, H, W), dtype=torch.float32, device=device)
+            for idx, (y0,y1,s1,x0,x1,s2) in enumerate(coords):
+                w = wmaps[idx][None, None, :, :]                   # [1,1,s1,s2]
+                p = patches_P2Tphw[idx, :, :, :s1, :s2].to(torch.float32)
+                num[:, :, y0:y1, x0:x1] += (p * w)
+                den[:, :, y0:y1, x0:x1] += w
+            den = torch.where(den == 0, torch.ones_like(den), den)
+            return (num / den).to(patches_P2Tphw.dtype)            # [2,T,H,W]
+
+        def _apply_A_twochan(x_2Thw: torch.Tensor, m_THW: torch.Tensor) -> torch.Tensor:
+            """
+            Apply forward operator A: FFT -> mask -> IFFT, on full frame.
+            x_2Thw: [2,T,H,W] (real/imag channels), m_THW: [T,H,W] in {0,1}
+            Returns two-channel image-domain result [2,T,H,W].
+            """
+            x_c = torch.complex(x_2Thw[0], x_2Thw[1])                         # [T,H,W]
+            k   = torch.fft.fftshift(torch.fft.fft2(x_c, norm="ortho"), dim=(-2, -1))
+            k_m = k * m_THW                                                   # [T,H,W] complex
+            x_d = torch.fft.ifft2(torch.fft.ifftshift(k_m, dim=(-2, -1)), norm="ortho")
+            return torch.stack((x_d.real.float(), x_d.imag.float()), dim=0)   # [2,T,H,W]
+
+        def _decode_all_patches_with_grad(z_Pcnhw: torch.Tensor, vae, max_bs: int) -> torch.Tensor:
+            """
+            Decode all patches with grad, micro-batching to control memory.
+            Returns [P,2,pt,ph,pw]; grads flow back to z.
+            """
+            outs = []
+            P = z_Pcnhw.shape[0]
+            for i in range(0, P, max_bs):
                 chunk = z_Pcnhw[i:i+max_bs]
-                z_list = [zz.unsqueeze(0) for zz in chunk]
-                dec = vae(z_list, op="decode")  # list of [1,2,pt,ph,pw]
+                z_list = [zz.unsqueeze(0) for zz in chunk]     # list of [1,Cz,nt,H',W']
+                with torch.autocast(device_type=chunk.device.type, dtype=torch.bfloat16):
+                    dec = vae(z_list, op="decode")             # list of [1,2,pt,ph,pw]
+                block = []
                 for o in dec:
                     if isinstance(o, (list, tuple)): o = o[0]
-                    p = o.squeeze(0).to(torch.float32)  # [2,pt,ph,pw]
-                    if out_num is None:
-                        pt_eff = int(p.shape[1])
-                        out_num = torch.zeros((2, pt_eff, H, W), dtype=torch.float32, device=z_Pcnhw.device)
-                        out_den = torch.zeros((1, pt_eff, H, W), dtype=torch.float32, device=z_Pcnhw.device)
-                    y0,y1,s1,x0,x1,s2,j,k, *_ = coords[idx]
-                    w1 = _axis_weights(s1, j, n1, O1, z_Pcnhw.device)
-                    w2 = _axis_weights(s2, k, n2, O2, z_Pcnhw.device)
-                    w  = (w1[None, None, :, None] * w2[None, None, None, :])      # [1,1,s1,s2]
-                    out_num[:, :, y0:y1, x0:x1] += (p[:, :, :s1, :s2] * w)
-                    out_den[:, :, y0:y1, x0:x1] += w
-                    idx += 1
-            out_den = torch.where(out_den == 0, torch.ones_like(out_den), out_den)
-            return out_num / out_den
+                    block.append(o.squeeze(0))                 # [2,pt,ph,pw]
+                outs.append(torch.stack(block, dim=0).float())
+            return torch.cat(outs, dim=0)                      # [P,2,pt,ph,pw]
 
-        # -------------- get one validation video --------------
+        # ----------------- config + setup -----------------
+        device = self.accelerator.device
+        self.model.eval()
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if use_ema:
+            self.ema.apply_to(unwrapped)
+
+        vcfg   = self.cfg.get("validation", {})
+        ph     = int(vcfg.get("patch_h", 80))
+        pw     = int(vcfg.get("patch_w", 80))
+        pt     = int(vcfg.get("patch_t", 7))                      # pixel-time chunk
+        val_decode_bs = int(vcfg.get("patch_batch", 64))          # old decode batch (no grads)
+        dc_decode_bs  = int(vcfg.get("dc_decode_bs", val_decode_bs))  # **with-grad** decode batch (tunable 1..P)
+        dc_inner_iters = int(vcfg.get("dc_inner_iters", 3))       # number of inner DC steps (default 3)
+        ov_pct = float(vcfg.get("overlap_spatial_pct", 1.0))      # e.g., 5.0 = 5%
+        dc_lmb = float(vcfg.get("dc_lambda", 0.3))                # guidance strength
+        dc_step_scale = float(vcfg.get("dc_step_scale", 1.0))     # extra multiplier
+
+        # cap any large with-grad decode batch conservatively
+        dc_decode_bs = max(1, dc_decode_bs)
+
+        R_default = int(self.cfg.get("deg", {}).get("R", 4))      # keep user's change (R=4)
+
+        # -------- grab one validation video --------
         try:
-            val_it = iter(self.val_dl)
-            batch_list = next(val_it)
+            it = iter(self.val_dl)
+            batch_list = next(it)
             x_true = None
             for item in batch_list:
                 x_true = item
@@ -1115,12 +1135,42 @@ class LatentFMTrainer:
             x_true = x_true.unsqueeze(1)
         _, T, H, W = x_true.shape
 
-        sh = _pct_to_stride_len(ph, overlap_spatial_pct)
-        sw = _pct_to_stride_len(pw, overlap_spatial_pct)
-        coords, n1, n2 = _spatial_coords(H, W, ph, pw, sh, sw)
+        sh = _pct_to_stride_len(ph, ov_pct)
+        sw = _pct_to_stride_len(pw, ov_pct)
+        coords, n1, n2 = _make_coords(H, W, ph, pw, sh, sw)
         P = len(coords)
+        wmaps = _build_wmaps(coords, device=device, dtype=torch.float32, mode="box")  # "box" => partition-of-unity
 
-        # latent geometry via dummy encode at this pt/ph/pw
+        # ----------------- SANITY A: constant tiles placement -----------------
+        if self.accelerator.is_main_process and bool(vcfg.get("debug_patch_placement", True)):
+            pt_dbg = 1
+            const_tiles = torch.zeros((P, 2, pt_dbg, ph, pw), device=device, dtype=torch.float32)
+            for idx, (y0,y1,s1,x0,x1,s2) in enumerate(coords):
+                val = (idx + 1) / (P + 1)
+                tile = torch.full((s1, s2), val, device=device)
+                tile[0:1, :] = 1.0; tile[-1:, :] = 1.0; tile[:, 0:1] = 1.0; tile[:, -1:] = 1.0  # thin border
+                const_tiles[idx, 0, 0, :s1, :s2] = tile
+            const_full = _blend_full(const_tiles, H, W, coords, wmaps)  # [2,1,H,W]
+            wandb.log({"sanity/constant_tiles": wandb.Image(_frame_to_uint8(const_full[0,0].unsqueeze(0)))},
+                    step=self.global_step)
+
+            # ----------------- SANITY B: global ramp -----------------
+            yy = torch.linspace(0, 1, steps=H, device=device).view(H, 1).expand(H, W)
+            xx = torch.linspace(0, 1, steps=W, device=device).view(1, W).expand(H, W)
+            ramp = ((yy + xx) * 0.5).to(torch.float32)  # [H,W]
+            full = torch.zeros((2, 1, H, W), device=device, dtype=torch.float32)
+            full[0, 0] = ramp
+            patches_r = _spatial_patchify_video(full, ph, pw, coords)      # [P,2,1,ph,pw]
+            recon_r   = _blend_full(patches_r, H, W, coords, wmaps)        # [2,1,H,W]
+            err = (recon_r[0,0] - ramp).abs()
+            wandb.log({
+                "sanity/global_ramp": wandb.Image(_frame_to_uint8(recon_r[0,0].unsqueeze(0))),
+                "sanity/global_ramp_error": wandb.Image(_frame_to_uint8((err*10.0).unsqueeze(0))),  # mag ×10
+                "sanity/global_ramp_mae": float(err.mean().detach().cpu()),
+                "sanity/global_ramp_max": float(err.max().detach().cpu()),
+            }, step=self.global_step)
+
+        # -------- latent geometry via dummy encode (pt,ph,pw) --------
         dummy = torch.zeros(1, 2, pt, ph, pw, device=device, dtype=torch.float32)
         vae_out = self.vae([dummy], op="encode")
         mu0 = vae_out[0][0] if isinstance(vae_out[0], (list, tuple)) else vae_out[0]
@@ -1128,100 +1178,73 @@ class LatentFMTrainer:
             mu0 = mu0.squeeze(0)
         Cz, nt, Hlat, Wlat = int(mu0.shape[0]), int(mu0.shape[1]), int(mu0.shape[2]), int(mu0.shape[3])
 
-        # linear sigmas (1 -> 0), fp32
+        # -------- linear sigmas 1→0, fp32 --------
         steps = int(self.cfg.get("sampler", {}).get("num_steps", 25))
         sigmas = torch.linspace(1.0, 0.0, steps=steps + 1, device=device, dtype=torch.float32)
 
-        # -------------- DC: chunked grad step on z --------------
-        def _dc_latent_from_x0(z_lat_Pcnhw: torch.Tensor,
-                            x_zf_TcHW: torch.Tensor,          # complex [Tc,H,W]
-                            step_vec_P: torch.Tensor) -> torch.Tensor:
-            """
-            Compute ∂L/∂z for small groups of patches and apply a gradient step:
-                L = mean(|| S(z) - x_zf ||^2)  where S(z) is overlap-add decode.
-            Only z requires grad; model/vae are frozen.
-            """
+        # ----------------- Patch-wise DC helper (3 inner steps by default) -----------------
+        def _dc_latent_from_x0_patchwise(
+            z_lat_Pcnhw: torch.Tensor,
+            x_zf_TcHW: torch.Tensor,        # complex [Tc<=pt, H, W]
+            m_THW_pad: torch.Tensor,        # [pt, H, W] in {0,1}
+            coords,
+            H: int, W: int, ph: int, pw: int, pt: int,
+            step_vec_P: torch.Tensor,       # [P]
+        ) -> torch.Tensor:
+
+            # Prepare two-channel ZF target (padded to pt) then patchify (no grad needed)
+            xzf_2Thw = torch.stack((x_zf_TcHW.real.float(), x_zf_TcHW.imag.float()), dim=0)  # [2,pt,H,W]
+            xzf_patches = _patchify_image_differentiable(xzf_2Thw.detach(), coords, ph, pw)  # [P,2,pt,ph,pw] (target)
+
             z = z_lat_Pcnhw
-            if not z.requires_grad:
-                z = z.clone().requires_grad_(True)
+            for _ in range(dc_inner_iters):
+                z = z.detach().requires_grad_(True)
 
-            with torch.no_grad():
-                S0 = _assemble_full_from_latents_nograd(self.vae, z.detach(),
-                                                        H, W, ph, pw, sh, sw, coords, max_bs=bs_vae)  # [2,pt,H,W]
-                pt_eff = int(S0.shape[1])
-                Tc = int(x_zf_TcHW.shape[0])
-                if pt_eff != Tc:
-                    if Tc < pt_eff:
-                        pad = pt_eff - Tc
-                        x_zf = torch.cat([x_zf_TcHW,
-                                        torch.zeros((pad, H, W), device=device, dtype=x_zf_TcHW.dtype)], dim=0)
-                    else:
-                        x_zf = x_zf_TcHW[:pt_eff]
-                else:
-                    x_zf = x_zf_TcHW
-                R_full = torch.stack((S0[0], S0[1]), dim=0) - \
-                        torch.stack((x_zf.real.float(), x_zf.imag.float()), dim=0)  # [2,pt,H,W] fp32
+                # (1) decode all patches WITH grad (micro-batched)
+                patches_dec = _decode_all_patches_with_grad(z, self.vae, dc_decode_bs)   # [P,2,pt,ph,pw]
 
-            # micro-batch over patches
-            Ptot = int(z.shape[0])
-            for i0 in range(0, Ptot, dc_patch_mb):
-                i1 = min(i0 + dc_patch_mb, Ptot)
-                idxs = list(range(i0, i1))
-                z_chunk = z[i0:i1]
-                z_chunk.requires_grad_(True)
+                # (2) blend to full complex frame (differentiable)
+                C_full = _blend_full(patches_dec, H, W, coords, wmaps)                    # [2,pt,H,W]
 
-                # decode with grad (bf16 autocast ok), then assemble only this chunk
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    z_list = [zz.unsqueeze(0) for zz in z_chunk]               # list [1,Cz,nt,H',W']
-                    dec = self.vae(z_list, op="decode")                         # list [1,2,pt,ph,pw]
-                    patches = []
-                    for o in dec:
-                        if isinstance(o, (list, tuple)): o = o[0]
-                        patches.append(o.squeeze(0))                            # [2,pt,ph,pw], bf16
-                    patches = torch.stack(patches, dim=0)                       # [Q,2,pt,ph,pw]
+                # (3) apply A globally: FFT -> mask -> IFFT (differentiable)
+                C_down = _apply_A_twochan(C_full, m_THW_pad)                              # [2,pt,H,W]
 
-                C_chunk = _assemble_subset_to_full(patches, idxs, H, W, ph, pw, sh, sw, coords)  # [2,pt,H,W] fp32
-                C_ng = C_chunk.detach()
-                L = (C_chunk + (R_full - C_ng)).pow(2).mean()                   # scalar fp32
+                # (4) patchify both sides => 1-to-1 patch loss
+                C_down_patches = _patchify_image_differentiable(C_down, coords, ph, pw)   # [P,2,pt,ph,pw]
 
-                (g_chunk,) = torch.autograd.grad(L, z_chunk, retain_graph=False, create_graph=False)
+                # (5) MSE in complex two-channel space
+                L = (C_down_patches - xzf_patches).pow(2).mean()
 
-                zs = step_vec_P[i0:i1].view(-1, *([1] * (z_chunk.ndim - 1)))
-                z_new = z_chunk - zs * g_chunk
+                # (6) ∇z and latent update
+                (g,) = torch.autograd.grad(L, z, retain_graph=False, create_graph=False)
+                step = (step_vec_P * dc_lmb * dc_step_scale).view(-1, *([1] * (z.ndim - 1)))  # [P,1,1,1,1]
+                step = 15.0
+                z = (z - step * g)
 
-                with torch.no_grad():
-                    z[i0:i1].copy_(z_new)
+            return z.detach()
 
-                del z_chunk, patches, C_chunk, C_ng, L, g_chunk
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            return z
-
-        # -------------- Euler(x0) + DC for one chunk --------------
+        # ----------------- Euler(x0) with DC per chunk -----------------
         def _sample_euler_x0_with_dc(raw_model, noise: torch.Tensor,
                                     sigmas: torch.Tensor,
-                                    x_zf_chunk_cmplx: torch.Tensor) -> torch.Tensor:
+                                    x_zf_chunk_cmplx: torch.Tensor,
+                                    m_THW_pad: torch.Tensor) -> torch.Tensor:
             """
-            noise: [P,Cz,nt,H',W']; x_zf_chunk_cmplx: complex [Tc<=pt, H, W]
-            returns: [P,Cz,nt,H',W']
+            noise: [P,Cz,nt,H',W']; x_zf_chunk_cmplx: complex [pt, H, W]
+            returns: [P,Cz,nt,H',W'] (x0 after DC-regularized reverse integration)
             """
-            x = noise.to(torch.float32)  # latent state (fp32)
+            x = noise.to(torch.float32)
             B = x.shape[0]
             total = sigmas.numel() - 1
 
-            pbar = tqdm(total=total,
-                        desc="Euler(x0)+DC",
-                        dynamic_ncols=True,
-                        leave=False,
+            pbar = tqdm(total=total, desc="Euler(x0)+DC", dynamic_ncols=True, leave=False,
                         disable=not self.accelerator.is_main_process)
             last = time.perf_counter()
 
             for i in range(total):
-                t = sigmas[i].expand(B)      # [P]
-                s = sigmas[i + 1].expand(B)  # [P]
+                t = sigmas[i].expand(B)
+                s = sigmas[i + 1].expand(B)
 
-                # model velocity (no grad; bf16 autocast)
+                # net velocity (no grad; bf16 autocast)
                 with torch.no_grad():
                     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                         u = raw_model(x.to(torch.bfloat16),
@@ -1229,16 +1252,21 @@ class LatentFMTrainer:
 
                 # predictor in latent space
                 x0_pred = x - _append_dims(t, x.ndim) * u
+                x1_pred = x + (1 - _append_dims(t, x.ndim)) * u
 
-                # DC every step: chunked grad only on z
-                step_vec = (t - s).abs() * dc_lambda  # [P]
+                # DC inner steps: patch-wise loss after A(full)
+                step_vec = (t - s).abs()                               # [P]
                 with torch.enable_grad():
-                    x0_dc = _dc_latent_from_x0(x0_pred, x_zf_chunk_cmplx, step_vec)  # [P,Cz,nt,H',W']
+                    x0_dc = _dc_latent_from_x0_patchwise(
+                        x0_pred, x_zf_chunk_cmplx, m_THW_pad, coords, H, W, ph, pw, pt, step_vec
+                    )
+
+                z0_t = _append_dims(t, x.ndim) * x0_dc + (1 - _append_dims(t, x.ndim)) * x0_pred
+                z1_t = _append_dims(s, x.ndim).sqrt() * x1_pred + (1 - _append_dims(s, x.ndim)).sqrt() * torch.randn_like(x1_pred)
 
                 # Euler(x0) update with DC-corrected x0
-                ratio = _append_dims((s / t.clamp_min(1e-8)), x.ndim)
-                x = ratio * x + (1.0 - ratio) * x0_dc
-                x = x.detach()  # prevent graph growth
+                x = (1 - _append_dims(s, x.ndim)) * z0_t + _append_dims(s, x.ndim) * z1_t
+                x = x.detach()
 
                 if self.accelerator.is_main_process:
                     now = time.perf_counter()
@@ -1250,20 +1278,17 @@ class LatentFMTrainer:
                 pbar.close()
             return x
 
-        raw_model = self.accelerator.unwrap_model(self.model)
-
-        # -------------- temporal chunks --------------
+        # ----------------- temporal chunks -----------------
         starts = _temporal_chunk_starts(T, pt)
-        recon_frames = []  # list of [2,H,W] tensors in time order
+        recon_frames = []   # list of [2,H,W] tensors in order
         prev_start, prev_len = None, None
 
-        # build zero-filled target per chunk once we know Tc
         for t0 in starts:
             t1 = min(t0 + pt, T)
             Tc_valid = int(t1 - t0)
             x_true_chunk = x_true[:, t0:t1]  # [2,Tc_valid,H,W]
 
-            # MR sampling mask over ky×time for this chunk
+            # --- build ZF target (complex) and pad to pt ---
             deg = MRIDeg(H, Tc_valid, R_default)
             mk = getattr(deg, "mask_ky_t", None)
             if callable(mk): mk = mk()
@@ -1272,43 +1297,109 @@ class LatentFMTrainer:
                 m_TH = m_TH.t()  # [Tc_valid, H]
             m_THW = m_TH[:, :, None].expand(Tc_valid, H, W)  # [Tc_valid,H,W]
 
-            # zero-filled complex pixels
-            kc_true = _fft2c(x_true_chunk)                            # complex [Tc_valid,H,W]
-            kc_meas = kc_true * m_THW                                 # sampled k-space
-            x_zf = _ifft2c(kc_meas)                                   # complex [Tc_valid,H,W]
+            kc_true = _fft2c(x_true_chunk)                      # complex [Tc_valid,H,W]
+            kc_meas = kc_true * m_THW
+            x_zf = _ifft2c(kc_meas)                             # complex [Tc_valid,H,W]
 
-            # pad to pt for the sampler/DC if needed
+            # pad ZF and mask in time to pt if needed
             if Tc_valid < pt:
                 pad = pt - Tc_valid
-                pad_c = torch.zeros((pad, H, W), device=device, dtype=x_zf.dtype)
-                x_zf_chunk = torch.cat([x_zf, pad_c], dim=0)          # [pt,H,W] complex
+                zpad_c = torch.zeros((pad, H, W), device=device, dtype=x_zf.dtype)
+                x_zf_chunk = torch.cat([x_zf, zpad_c], dim=0)            # [pt,H,W] complex
+                m_pad = torch.cat([m_THW, torch.zeros((pad, H, W), device=device)], dim=0)  # [pt,H,W]
             else:
-                x_zf_chunk = x_zf                                     # [pt,H,W]
+                x_zf_chunk = x_zf
+                m_pad = m_THW
 
-            # init latent noise for all spatial patches
+            # --- reverse sampling in latent space with DC ---
             noise = torch.randn((P, Cz, nt, Hlat, Wlat), device=device, dtype=torch.float32)
+            z_x0 = _sample_euler_x0_with_dc(unwrapped, noise, sigmas, x_zf_chunk, m_pad)  # [P,Cz,nt,H',W']
 
-            # run Euler(x0)+DC
-            z_x0 = _sample_euler_x0_with_dc(raw_model, noise, sigmas, x_zf_chunk)  # [P,Cz,nt,H',W']
-
-            # decode & assemble to full [2,pt,H,W] (no grad)
+            # --- decode patches and seamless assemble (no grad) ---
             with torch.no_grad():
-                patches_dec = _decode_latent_patches(z_x0, max_bs=bs_vae)                      # [P,2,pt,ph,pw]
-                xhat_full   = _depatchify2d_over_time(patches_dec, H, W, ph, pw, sh, sw, coords)  # [2,pt,H,W]
+                # micro-batch (no-grad) decode for logging
+                outs = []
+                for i in range(0, z_x0.shape[0], val_decode_bs):
+                    chunk = z_x0[i:i+val_decode_bs]
+                    z_list = [z.unsqueeze(0) for z in chunk]
+                    dec = self.vae(z_list, op="decode")      # list [1,2,pt,ph,pw]
+                    for o in dec:
+                        if isinstance(o, (list, tuple)): o = o[0]
+                        outs.append(o.squeeze(0))            # [2,pt,ph,pw]
+                patches_dec = torch.stack(outs, dim=0)       # [P,2,pt,ph,pw]
+                xhat_full   = _blend_full(patches_dec, H, W, coords, wmaps)  # [2,pt,H,W]
 
-            # log per-chunk video (valid frames only)
+            # --- log triptych GT|ZFR|DC for the valid frames in this chunk ---
             if self.accelerator.is_main_process:
                 frames = []
+                fps = int(self.cfg.get("logging", {}).get("latent_grid_fps", 7))
                 for tt in range(Tc_valid):
-                    mag = torch.sqrt(torch.clamp(xhat_full[0, tt]**2 + xhat_full[1, tt]**2, min=0.0)).unsqueeze(0)
-                    frames.append(_frame_to_uint8(mag))  # uses your helper
-                arr = _np.stack(frames, axis=0)            # [Tc_valid,H,W]
+                    gt_mag = _to_mag(x_true_chunk[:, tt]).unsqueeze(0)     # [1,H,W]
+                    zf_mag = _to_mag_from_complex(x_zf[tt]).unsqueeze(0)   # [1,H,W]
+                    dc_mag = _to_mag(xhat_full[:, tt]).unsqueeze(0)        # [1,H,W]
+
+                    gt_u8 = _frame_to_uint8(gt_mag)
+                    zf_u8 = _frame_to_uint8(zf_mag)
+                    dc_u8 = _frame_to_uint8(dc_mag)
+
+                    trip = _np.concatenate([gt_u8, zf_u8, dc_u8], axis=-1) # [H, 3W]
+                    frames.append(trip)
+
+                arr = _np.stack(frames, axis=0)  # [T, H, 3W]
                 arr = arr[:, None, :, :]
                 arr = _np.repeat(arr, 3, axis=1)
-                vid = wandb.Video(arr, fps=int(self.cfg.get("logging", {}).get("latent_grid_fps", 7)), format="mp4")
-                wandb.log({f"val/dc_chunk_{t0:04d}": vid}, step=self.global_step)
+                vid = wandb.Video(arr, fps=fps, format="mp4")
+                wandb.log({f"val/dc_chunk_triptych_{t0:04d}": vid}, step=self.global_step)
 
-            # collect recon frames (stitch across overlapping chunks)
+                try:
+                    # patchify GT (2,Tc,H,W) -> [P,2,Tc,ph,pw]
+                    gt_patches = _spatial_patchify_video(x_true_chunk, ph, pw, coords)[:, :, :Tc_valid]
+                    # patchify DC recon for valid frames
+                    dc_patches = _spatial_patchify_video(xhat_full[:, :Tc_valid], ph, pw, coords)
+                    # patchify ZF (build 2-ch first)
+                    zf_2Thw = torch.stack((x_zf.real.float(), x_zf.imag.float()), dim=0)  # [2,Tc,H,W]
+                    zf_patches = _spatial_patchify_video(zf_2Thw, ph, pw, coords)
+
+                    # magnitude tensors
+                    gt_mag = torch.sqrt(gt_patches[:, 0]**2 + gt_patches[:, 1]**2)  # [P,Tc,ph,pw]
+                    zf_mag = torch.sqrt(zf_patches[:, 0]**2 + zf_patches[:, 1]**2)  # [P,Tc,ph,pw]
+                    dc_mag = torch.sqrt(dc_patches[:, 0]**2 + dc_patches[:, 1]**2)  # [P,Tc,ph,pw]
+
+                    # score patches by coverage above a small floor (use GT)
+                    px_thr_plot = float(vcfg.get("plot_px_thr", 0.05))
+                    plot_min_frac = float(vcfg.get("plot_min_frac", 0.1))  # ignore near-empty patches
+                    frac = (gt_mag > px_thr_plot).float().mean(dim=(1, 2, 3))  # [P]
+
+                    # pick top-K non-empty
+                    K = int(vcfg.get("num_patch_compare", 4))
+                    K = max(1, min(K, P))
+                    nonzero = torch.nonzero(frac > plot_min_frac, as_tuple=False).flatten()
+                    if nonzero.numel() > 0:
+                        f_sel = frac[nonzero]
+                        topk = torch.topk(f_sel, k=min(K, f_sel.numel()), largest=True).indices
+                        idxs = nonzero[topk]
+                    else:
+                        idxs = torch.arange(K, device=device)
+
+                    # build a mosaic using the center frame
+                    t_center = min(Tc_valid // 2, Tc_valid - 1)
+                    rows = []
+                    for gidx in idxs.tolist():
+                        gt_u8 = _frame_to_uint8(gt_mag[gidx, t_center].unsqueeze(0))
+                        zf_u8 = _frame_to_uint8(zf_mag[gidx, t_center].unsqueeze(0))
+                        dc_u8 = _frame_to_uint8(dc_mag[gidx, t_center].unsqueeze(0))
+                        row = np.concatenate([gt_u8, zf_u8, dc_u8], axis=1)  # [ph, 3*pw]
+                        rows.append(row)
+                    mosaic = np.concatenate(rows, axis=0)  # [K*ph, 3*pw]
+
+                    if self.accelerator.is_main_process:
+                        wandb.log({"val/patch_triptych4_center": wandb.Image(mosaic)}, step=self.global_step)
+
+                except Exception as e:
+                    if self.accelerator.is_main_process:
+                        print("[warn] patch-level comparison failed:", e)
+
+            # --- stitch chunk back into sequence (temporal overlap = 1 frame) ---
             if prev_start is None:
                 for f in range(Tc_valid):
                     recon_frames.append(xhat_full[:, f])
@@ -1322,16 +1413,18 @@ class LatentFMTrainer:
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            
+
+            # process only the first chunk by default (keep runtime reasonable)
             break
 
-        # -------------- final full-video logging --------------
+        # ----------------- final full-video logging -----------------
         with torch.no_grad():
-            recon = torch.stack(recon_frames, dim=1)  # [2,T,H,W]
+            recon = torch.stack(recon_frames, dim=1)  # [2,T',H,W] (T' ≤ T)
             if self.accelerator.is_main_process:
                 frames = []
-                for t in range(T):
-                    mag = torch.sqrt(torch.clamp(recon[0, t]**2 + recon[1, t]**2, min=0.0)).unsqueeze(0)
+                Tprime = recon.shape[1]
+                for t in range(Tprime):
+                    mag = _to_mag(recon[:, t]).unsqueeze(0)
                     frames.append(_frame_to_uint8(mag))
                 arr = _np.stack(frames, axis=0)
                 arr = arr[:, None, :, :]
@@ -1341,7 +1434,9 @@ class LatentFMTrainer:
 
         if use_ema:
             self.ema.restore(unwrapped)
+
         self.model.train()
+
 
     # -------- checkpoint --------
     def save_checkpoint(self):
@@ -1408,12 +1503,8 @@ def main(config_path: str):
         ckpt = torch.load(pretrained_path, map_location="cpu")
 
         # If *not* resuming and EMA exists, load EMA weights; otherwise load raw model
-        if (not resume_flag) and ("ema" in ckpt):
-            print(f"[FM] loaded EMA weights from {pretrained_path}")
-            state = ckpt["ema"]
-        else:
-            print(f"[FM] loaded non-EMA weights from {pretrained_path}")
-            state = ckpt.get("model", ckpt)
+        print(f"[FM] loaded non-EMA weights from {pretrained_path}")
+        state = ckpt.get("model", ckpt)
 
         # strip possible wrappers
         new_sd = OrderedDict((k[10:] if k.startswith("_orig_mod.") else k, v) for k, v in state.items())

@@ -348,6 +348,13 @@ class SingleStreamBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.mlp = MLP(dim, mlp_ratio=mlp_ratio)
 
+        nn.init.zeros_(self.proj_attn.weight)
+        nn.init.zeros_(self.proj_attn.bias)
+        nn.init.zeros_(self.mlp.fc2.weight)
+        nn.init.zeros_(self.mlp.fc2.bias)
+        nn.init.zeros_(self.adaln.linear.weight)
+        nn.init.zeros_(self.adaln.linear.bias)
+
     def forward(self, x, tvec, rope_freqs=None):
         B, L, D = x.shape
 
@@ -403,6 +410,20 @@ class FinalProjector(nn.Module):
         y = y.reshape(B, self.out_ch, T*self.pt, H*self.ph, W*self.pw)  # [B,C,T,H,W]
         return y
 
+
+class AdaLayerNormContinuous(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.fc = nn.Linear(dim, 2 * dim)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, D], emb: [B, D]
+        scale, shift = self.fc(self.act(emb)).chunk(2, dim=-1)  # [B, D] each
+        x = self.norm(x)
+        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return x
 
 # -----------------------------------------------------------------------------
 # Main transformer (unchanged API; now with RoPE + backend-priority attention)
@@ -467,6 +488,7 @@ class FlowMatchTransformer(nn.Module):
             for _ in range(depth)
         ])
         # Final projection (velocity)
+        self.norm_out = AdaLayerNormContinuous(self.hidden)
         self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(8, 32, 32))  # created at runtime after we know token grid
 
         # ---------------- TeaCache state ----------------
