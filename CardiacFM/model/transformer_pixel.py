@@ -595,6 +595,7 @@ class FlowMatchTransformer(nn.Module):
             for blk in self.blocks:
                 x = blk(x, tvec, rope_freqs=rope_freqs)
 
+        x = self.norm_out(x, tvec)
         vel = self.final(x)  # [B,Cz,n,H,W]
         return vel
         
