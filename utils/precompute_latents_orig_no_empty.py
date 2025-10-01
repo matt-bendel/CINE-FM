@@ -147,6 +147,7 @@ def precompute_train_latents_like_cine(
     empty_frac_thr: float,
     min_nonempty: int,
     require_center_nonempty: bool,
+    include_vflip: bool,
 ):
     assert fixed_L == 7, "L must be 7 (fixed)."
     assert fixed_L % 2 == 1, "L must be odd."
@@ -184,6 +185,7 @@ def precompute_train_latents_like_cine(
         "latent_shape": {"Cz": Cz, "T_lat": nt, "H": H_lat, "W": W_lat},
         "pixel_clip": {"L": fixed_L, "crop_h": crop_h, "crop_w": crop_w},
         "include_flip": bool(include_flip),
+        "include_vflip": bool(include_vflip),  # NEW
         "emptiness": {
             "enabled": bool(skip_empty),
             "q": float(empty_q),
@@ -280,6 +282,7 @@ def precompute_train_latents_like_cine(
                         "source_key": key,
                         "sample_idx": int(si),
                         "flip": 0,
+                        "vflip": 0,            # NEW
                         "L_pixel": int(fixed_L),
                         "crop_h": int(crop_h),
                         "crop_w": int(crop_w),
@@ -298,6 +301,7 @@ def precompute_train_latents_like_cine(
                             "source_key": key,
                             "sample_idx": int(si),
                             "flip": 1,
+                            "vflip": 0,
                             "L_pixel": int(fixed_L),
                             "crop_h": int(crop_h),
                             "crop_w": int(crop_w),
@@ -305,6 +309,43 @@ def precompute_train_latents_like_cine(
                         stats["kept_clips"] += 1
                         if len(buf_x) >= vae_batch:
                             flush()
+
+                    # optional vertical flip (mirror H)
+                    if include_vflip:
+                        clip_vflip = clip.flip(-2)  # flip height dimension
+                        # No need to re-check emptiness; flip preserves energy stats.
+                        buf_x.append(clip_vflip)
+                        buf_meta.append({
+                            "source_shard": os.path.basename(sp),
+                            "source_key": key,
+                            "sample_idx": int(si),
+                            "flip": int(0),      # horizontal flip flag stays 0 here
+                            "vflip": int(1),     # NEW: mark vertical flip
+                            "L_pixel": int(fixed_L),
+                            "crop_h": int(crop_h),
+                            "crop_w": int(crop_w),
+                        })
+                        stats["kept_clips"] += 1
+                        if len(buf_x) >= vae_batch:
+                            flush()
+                    
+                    if include_flip and include_vflip:
+                        clip_hv = clip.flip(-1).flip(-2)
+                        buf_x.append(clip_hv)
+                        buf_meta.append({
+                            "source_shard": os.path.basename(sp),
+                            "source_key": key,
+                            "sample_idx": int(si),
+                            "flip": 1,
+                            "vflip": 1,
+                            "L_pixel": int(fixed_L),
+                            "crop_h": int(crop_h),
+                            "crop_w": int(crop_w),
+                        })
+                        stats["kept_clips"] += 1
+                        if len(buf_x) >= vae_batch:
+                            flush()
+
 
     flush()
     if hf is not None: hf.close()
@@ -331,6 +372,7 @@ def main():
     ap.add_argument("--crop_w",  type=int, default=80)
     ap.add_argument("--samples_per_video", type=int, default=4)
     ap.add_argument("--include_flip", action="store_true")
+    ap.add_argument("--include_vflip", action="store_true")
 
     ap.add_argument("--device",    default="cuda")
     ap.add_argument("--vae_batch", type=int, default=64)  # big is fine (no grads)
@@ -341,11 +383,11 @@ def main():
                     help="Drop clips where too many frames are near-empty.")
     ap.add_argument("--empty_q", type=float, default=0.99,
                     help="Quantile for per-frame energy scoring.")
-    ap.add_argument("--empty_q_thr", type=float, default=0.3,
+    ap.add_argument("--empty_q_thr", type=float, default=0.35,
                     help="Threshold on that quantile to count a frame as non-empty.")
     ap.add_argument("--empty_px_thr", type=float, default=0.05,
                     help="Pixel floor used in the fraction-of-pixels test.")
-    ap.add_argument("--empty_frac_thr", type=float, default=0.3,
+    ap.add_argument("--empty_frac_thr", type=float, default=0.4,
                     help="Min fraction of pixels above empty_px_thr for a frame to be non-empty.")
     ap.add_argument("--min_nonempty", type=int, default=5,
                     help="Require at least this many non-empty frames in a 7-frame clip.")
@@ -380,6 +422,7 @@ def main():
         empty_frac_thr=float(args.empty_frac_thr),
         min_nonempty=int(args.min_nonempty),
         require_center_nonempty=bool(args.require_center_nonempty),
+        include_vflip=bool(args.include_vflip),
     )
 
 if __name__ == "__main__":

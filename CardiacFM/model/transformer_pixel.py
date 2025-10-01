@@ -348,12 +348,12 @@ class SingleStreamBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.mlp = MLP(dim, mlp_ratio=mlp_ratio)
 
-        nn.init.zeros_(self.proj_attn.weight)
-        nn.init.zeros_(self.proj_attn.bias)
-        nn.init.zeros_(self.mlp.fc2.weight)
-        nn.init.zeros_(self.mlp.fc2.bias)
-        nn.init.zeros_(self.adaln.linear.weight)
-        nn.init.zeros_(self.adaln.linear.bias)
+        nn.init.normal_(self.proj_attn.weight, mean=0.0, std=1e-2)
+        nn.init.normal_(self.proj_attn.bias, mean=0.0, std=1e-2)
+        nn.init.normal_(self.mlp.fc2.weight, mean=0.0, std=1e-2)
+        nn.init.normal_(self.mlp.fc2.bias, mean=0.0, std=1e-2)
+        nn.init.normal_(self.adaln.linear.weight, mean=0.0, std=1e-2)
+        nn.init.normal_(self.adaln.linear.bias, mean=0.0, std=1e-2)
 
     def forward(self, x, tvec, rope_freqs=None):
         B, L, D = x.shape

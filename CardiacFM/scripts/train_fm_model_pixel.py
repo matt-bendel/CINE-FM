@@ -141,10 +141,11 @@ class PixelFMTrainer:
     def __init__(self, model: nn.Module, train_dl: DataLoader, val_dl: DataLoader, cfg: Dict[str, Any]):
         cfg['logging']['out_dir'] = os.path.join(cfg['logging']['out_dir'], "flowmatch_pixels")
         self.cfg = cfg
-        self.model = torch.compile(model, fullgraph=False)
+        self.model = model
+        # self.model = torch.compile(model, fullgraph=False)
 
         # keep t_scale at 1000 unless overridden
-        self.t_scale = float(cfg.get("sampler", {}).get("t_scale", 1000.0))
+        self.t_scale = 1000.0 #float(cfg.get("sampler", {}).get("t_scale", 1000.0))
 
         proj_cfg = ProjectConfiguration(project_dir=cfg["logging"]["out_dir"])
         ddp_kwargs = DistributedDataParallelKwargs(broadcast_buffers=False, find_unused_parameters=False)

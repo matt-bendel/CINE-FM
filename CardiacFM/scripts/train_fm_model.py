@@ -245,11 +245,34 @@ class LatentFMTrainer:
         )
 
         self.scheduler = None
-        if opt_cfg.get("scheduler", {}).get("type", "none") == "cosine":
-            eta_min = opt_cfg["lr"] * opt_cfg["scheduler"].get("eta_min_ratio", 0.1)
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=self.total_steps * 4, eta_min=eta_min
-            )
+        sch_cfg = opt_cfg.get("scheduler", {})
+        if sch_cfg.get("type", "none") in ("cosine", "warmup_cosine"):
+            # --- config knobs (with sensible defaults) ---
+            warmup_steps = int(sch_cfg.get(
+                "warmup_steps",
+                max(500, int(0.01 * self.total_steps))  # default: 3% of total steps, min 500
+            ))
+            eta_min_ratio = float(sch_cfg.get("eta_min_ratio", 0.1))  # final LR = base_lr * eta_min_ratio
+            base_lr = float(opt_cfg["lr"])
+            eta_min = base_lr * eta_min_ratio
+
+            # Cosine applies to the remaining steps after warmup
+            T_max = max(1, self.total_steps - max(0, warmup_steps))
+
+            def _lr_lambda(step: int) -> float:
+                step = int(step / 4)
+                # LambdaLR expects a multiplier for base_lr
+                if warmup_steps > 0 and step < warmup_steps:
+                    # Linear warmup from ~0 → 1 over `warmup_steps`
+                    return max(1e-8, (step + 1) / float(warmup_steps))
+                # Cosine decay from 1 → eta_min_ratio over T_max steps
+                s = step - warmup_steps
+                s = max(0, min(s, T_max))  # clamp to [0, T_max]
+                cos_term = 0.5 * (1.0 + math.cos(math.pi * s / float(T_max)))
+                # standard cosine from 1 → 0, then shift to end at eta_min_ratio
+                return eta_min_ratio + (1.0 - eta_min_ratio) * cos_term
+
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=_lr_lambda)
 
         self.train_dl = train_dl
         self.val_dl   = val_dl
@@ -379,10 +402,7 @@ class LatentFMTrainer:
         # Rectified flow loss (same math as before, just no permutation/flattening)
         N = Z.shape[0]
         noise  = torch.randn_like(Z)                        # bf16
-        if self.global_step < 100000:
-            t_vec  = torch.rand((N,), device=device, dtype=torch.bfloat16).sqrt()   # U(0,1)
-        else:
-            t_vec  = torch.rand((N,), device=device, dtype=torch.bfloat16)   # U(0,1)
+        t_vec  = torch.rand((N,), device=device, dtype=torch.bfloat16)   # U(0,1)
 
         t_b = t_vec.view(N, *([1] * (Z.dim() - 1)))        # [B,1,1,1,1]
         x_t = (1.0 - t_b) * Z + t_b * noise                # bf16
