@@ -425,6 +425,26 @@ class AdaLayerNormContinuous(nn.Module):
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         return x
 
+class FinalProjectorInterp(nn.Module):
+    def __init__(self, dim, out_ch, twh=(8,32,32), up=(1,2,2), mid_ch=256):
+        super().__init__()
+        self.twh = twh
+        self.up = up
+        self.fc = nn.Linear(dim, mid_ch)                         # per-token feature
+        self.post = nn.Sequential(                               # smooth after interp
+            nn.Conv3d(mid_ch, mid_ch, kernel_size=(1,3,3), padding=(0,1,1)),
+            nn.GELU(),
+            nn.Conv3d(mid_ch, out_ch, kernel_size=1),
+        )
+
+    def forward(self, x):  # [B,L,D]
+        B, L, D = x.shape
+        T, H, W = self.twh
+        f = self.fc(x).view(B, T, H, W, -1).permute(0,4,1,2,3).contiguous()  # [B, Cmid, T, H, W]
+        f = F.interpolate(f, scale_factor=self.up, mode="trilinear", align_corners=False)  # [B, Cmid, T*pt, H*ph, W*pw]
+        y = self.post(f)  # [B, C, T, H, W]
+        return y
+
 # -----------------------------------------------------------------------------
 # Main transformer (unchanged API; now with RoPE + backend-priority attention)
 # + TeaCache support
@@ -489,7 +509,7 @@ class FlowMatchTransformer(nn.Module):
         ])
         # Final projection (velocity)
         self.norm_out = AdaLayerNormContinuous(self.hidden)
-        self.final = FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(8, 32, 32))  # created at runtime after we know token grid
+        self.final = FinalProjectorInterp(self.hidden, self.latent_channels)#FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(8, 32, 32))  # created at runtime after we know token grid
 
         # ---------------- TeaCache state ----------------
         self._tc_enabled = False

@@ -50,7 +50,7 @@ model:
   resume: false
 
 optim:
-  lr: 0.0002
+  lr: 0.0001
   betas: [0.9, 0.99]
   weight_decay: 0.01
   grad_clip: 1.0
