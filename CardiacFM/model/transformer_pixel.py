@@ -429,7 +429,7 @@ class FinalProjectorSmoothed(nn.Module):
     """
     Keep your linear unpatchify for speed, then add a light 3D conv to blend across 2x2 seams.
     """
-    def __init__(self, dim, out_ch, patch_size=(1,2,2), twh=(4,20,20), smooth_channels: int = 64):
+    def __init__(self, dim, out_ch, patch_size=(1,2,2), twh=(8,32,32), smooth_channels: int = 64):
         super().__init__()
         self.pt, self.ph, self.pw = patch_size
         self.twh = twh
