@@ -425,6 +425,37 @@ class AdaLayerNormContinuous(nn.Module):
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         return x
 
+class FinalProjectorSmoothed(nn.Module):
+    """
+    Keep your linear unpatchify for speed, then add a light 3D conv to blend across 2x2 seams.
+    """
+    def __init__(self, dim, out_ch, patch_size=(1,2,2), twh=(4,20,20), smooth_channels: int = 64):
+        super().__init__()
+        self.pt, self.ph, self.pw = patch_size
+        self.twh = twh
+        self.proj = nn.Linear(dim, out_ch * self.pt * self.ph * self.pw)
+
+        # light conv head AFTER upsample to blend seams
+        self.post = nn.Sequential(
+            # 1x1 to a small hidden, cheap
+            nn.Conv3d(out_ch, smooth_channels, kernel_size=1, stride=1, padding=0),
+            nn.GELU(),
+            # 1x3x3 mixes across seam; 1 in time keeps cost low
+            nn.Conv3d(smooth_channels, smooth_channels, kernel_size=(1,3,3), stride=1, padding=(0,1,1), groups=1),
+            nn.GELU(),
+            nn.Conv3d(smooth_channels, out_ch, kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(self, x):  # x: [B, L, D]
+        B, L, D = x.shape
+        T, H, W = self.twh
+        y = self.proj(x)                                    # [B, L, C*pt*ph*pw]
+        y = y.view(B, T, H, W, -1, self.pt, self.ph, self.pw)
+        y = y.permute(0,4,1,5,2,6,3,7).contiguous()         # [B,C,T,pt,H,ph,W,pw]
+        y = y.view(B, -1, T*self.pt, H*self.ph, W*self.pw)  # [B,C,T,H,W]
+        y = self.post(y)
+        return y
+
 class FinalProjectorInterp(nn.Module):
     def __init__(self, dim, out_ch, twh=(8,32,32), up=(1,2,2), mid_ch=256):
         super().__init__()
@@ -509,7 +540,7 @@ class FlowMatchTransformer(nn.Module):
         ])
         # Final projection (velocity)
         self.norm_out = AdaLayerNormContinuous(self.hidden)
-        self.final = FinalProjectorInterp(self.hidden, self.latent_channels)#FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(8, 32, 32))  # created at runtime after we know token grid
+        self.final = FinalProjectorSmoothed(self.hidden, self.latent_channels)#FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(8, 32, 32))  # created at runtime after we know token grid
 
         # ---------------- TeaCache state ----------------
         self._tc_enabled = False

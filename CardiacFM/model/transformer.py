@@ -509,7 +509,7 @@ class LatentFlowMatchTransformer(nn.Module):
         ])
         # Final projection (velocity)
         self.norm_out = AdaLayerNormContinuous(self.hidden)
-        self.final = FinalProjectorInterp(self.hidden, self.latent_channels)#FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(4, 20, 20))  # created at runtime after we know token grid
+        self.final = FinalProjectorSmoothed(self.hidden, self.latent_channels)#FinalProjector(self.hidden, self.latent_channels, patch_size=self.patch_size, twh=(4, 20, 20))  # created at runtime after we know token grid
 
         # ---------------- TeaCache state ----------------
         self._tc_enabled = False
